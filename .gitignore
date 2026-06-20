@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+
+# Vendor binaries (proprietary TUTK SDK + Android bionic runtime). Provide them locally;
+# see docs/SETUP.md. Distributing ThroughTek's libraries is not allowed.
+# Keep the folder structure and the placeholder READMEs, ignore the actual binaries.
+vendor/lib/*
+!vendor/lib/README.md
+vendor/bionic/*
+!vendor/bionic/README.md
+vendor/ioctl9930.bin
+
+# build artifacts
+*.tar.gz
+mediamtx
+__pycache__/

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720" font-family="system-ui,Segoe UI,Roboto,sans-serif">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="75%">
+      <stop offset="0%" stop-color="#1a2030"/>
+      <stop offset="100%" stop-color="#0b0d12"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <!-- stars -->
+  <g fill="#5b6478">
+    <circle cx="220" cy="140" r="3"/><circle cx="360" cy="90" r="2"/><circle cx="980" cy="120" r="3"/>
+    <circle cx="1080" cy="220" r="2"/><circle cx="180" cy="300" r="2"/><circle cx="1120" cy="430" r="3"/>
+    <circle cx="300" cy="520" r="2"/><circle cx="1000" cy="560" r="2"/><circle cx="150" cy="470" r="2"/>
+  </g>
+  <!-- crescent moon -->
+  <g transform="translate(640,300)">
+    <circle cx="0" cy="0" r="92" fill="#e8eaed"/>
+    <circle cx="34" cy="-18" r="80" fill="#1a2030"/>
+  </g>
+  <!-- Zzz -->
+  <g fill="#9aa0aa" font-weight="700">
+    <text x="752" y="232" font-size="34">z</text>
+    <text x="784" y="200" font-size="46">z</text>
+    <text x="824" y="160" font-size="60">Z</text>
+  </g>
+  <text x="640" y="486" fill="#e8eaed" font-size="56" font-weight="700" text-anchor="middle">Robot in sleep mode</text>
+  <text x="640" y="540" fill="#6b7280" font-size="26" text-anchor="middle">EBO-SE — camera off</text>
+</svg>

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0e1014">
+<title>EBO-SE</title>
+<style>
+ :root{--bg:#0e1014;--card:#161b26;--card2:#1c2230;--line:#2a3142;--fg:#e8eaed;--mut:#8b93a3;--accent:#2563eb;--ok:#2ecc71;--warn:#eab308;--rel:#e08a3c;--bad:#e74c3c}
+ *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+ html,body{margin:0}
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);
+      overscroll-behavior:none;touch-action:manipulation}
+ .app{max-width:480px;margin:0 auto;padding:0 14px 28px;display:flex;flex-direction:column;gap:12px}
+ /* top bar */
+ .bar{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;gap:10px;
+      padding:12px 4px;background:linear-gradient(var(--bg) 70%,transparent)}
+ .id{display:flex;align-items:center;gap:9px;font-size:17px;font-weight:700}
+ .dot{width:9px;height:9px;border-radius:50%;background:var(--bad);box-shadow:0 0 8px currentColor;color:var(--bad)}
+ .chips{display:flex;gap:7px;align-items:center}
+ .chip{font-size:12px;font-weight:600;padding:4px 9px;border-radius:999px;background:var(--card2);border:1px solid var(--line);color:var(--mut)}
+ .chip.s-live{color:#0c1b12;background:var(--ok);border-color:var(--ok)} .chip.s-slp{color:#1c1707;background:var(--warn);border-color:var(--warn)}
+ .chip.s-rel{color:#1c1207;background:var(--rel);border-color:var(--rel)} .chip.s-off{color:#fff;background:var(--bad);border-color:var(--bad)}
+ /* video */
+ .stage{background:#000;border-radius:16px;overflow:hidden;aspect-ratio:16/9;position:relative;border:1px solid var(--line)}
+ .stage video{width:100%;height:100%;object-fit:contain;background:#000;display:block}
+ .overlay{position:absolute;inset:0;display:none}.overlay img{width:100%;height:100%;object-fit:cover}
+ .sleeping .overlay{display:block}
+ .povr{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;
+       background:var(--bg);font-size:18px;font-weight:700;gap:8px;padding:18px}
+ .povr span{font-size:13px;font-weight:400;color:var(--mut)}
+ .paused .povr{display:flex}.paused .overlay{display:none}
+ /* quick actions */
+ .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}
+ .act{display:flex;flex-direction:column;align-items:center;gap:4px;padding:11px 4px;border-radius:14px;border:1px solid var(--line);
+      background:var(--card);color:var(--fg);font-size:11.5px;font-weight:600;cursor:pointer;transition:transform .05s,background .1s}
+ .act b{font-size:22px;font-weight:400;line-height:1}
+ .act:active{background:var(--accent);transform:scale(.95)}
+ /* connection toggle */
+ .conn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:12px;border-radius:14px;cursor:pointer;
+       font-size:14px;font-weight:600;background:var(--card);color:var(--fg);border:1px solid var(--line)}
+ .conn:active{transform:scale(.99)} .conn.on{background:var(--rel);border-color:var(--rel);color:#160d03}
+ .conn[disabled]{opacity:.5}
+ /* joystick card */
+ .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px}
+ .joy{width:230px;height:230px;border-radius:50%;margin:2px auto 0;position:relative;touch-action:none;cursor:grab;
+      background:radial-gradient(circle at 50% 42%,#27304a 0%,#1a2030 62%,#11151e 100%);border:1px solid var(--line);box-shadow:inset 0 0 34px rgba(0,0,0,.65)}
+ .joy::after{content:"";position:absolute;inset:50% auto auto 50%;width:6px;height:6px;border-radius:50%;background:#3a4151;transform:translate(-50%,-50%)}
+ .knob{width:90px;height:90px;border-radius:50%;position:absolute;left:50%;top:50%;
+       transform:translate(-50%,-50%);background:radial-gradient(circle at 36% 30%,#6aa3ff,#2563eb);box-shadow:0 6px 18px rgba(0,0,0,.6);transition:transform .09s ease-out}
+ .joy.drag{cursor:grabbing}.joy.drag .knob{transition:none}
+ .hint{text-align:center;font-size:12px;color:var(--mut);margin-top:12px}
+ .speed{display:flex;align-items:center;gap:10px;margin-top:14px;font-size:13px;color:var(--mut)}
+ .speed b{color:var(--fg);font-variant-numeric:tabular-nums;min-width:34px;text-align:right}
+ input[type=range]{flex:1;accent-color:var(--accent);height:26px}
+ /* accordions */
+ .acc{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+ .acc>summary{list-style:none;cursor:pointer;padding:14px 16px;font-size:14px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+ .acc>summary::-webkit-details-marker{display:none}
+ .acc>summary::after{content:"⌄";color:var(--mut);font-size:18px;transition:transform .2s}
+ .acc[open]>summary::after{transform:rotate(180deg)}
+ .accbody{padding:0 16px 16px}
+ .tgs{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+ .tg{padding:11px;border-radius:12px;border:1px solid var(--line);background:var(--card2);color:var(--fg);font-size:13px;cursor:pointer;text-align:center}
+ .tg.on{background:#16794a;border-color:#1e9b60;color:#eafff3}
+ .pad{display:grid;grid-template-columns:repeat(3,1fr);grid-auto-rows:1fr;gap:9px;max-width:240px;margin:0 auto}
+ .pad .btn{aspect-ratio:1;background:var(--card2);border:1px solid var(--line);color:var(--fg);border-radius:14px;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer}
+ .pad .btn:active{background:var(--accent);transform:scale(.94)}.pad .btn.empty{background:transparent;border:none;pointer-events:none}
+ .diag{text-align:center;font-size:11px;color:#5b6373;font-family:ui-monospace,monospace}
+</style></head><body>
+<div class="app">
+ <header class="bar">
+  <div class="id"><span class="dot" id="dot"></span> EBO-531</div>
+  <div class="chips"><span class="chip" id="state">…</span><span class="chip" id="batt">🔋 —</span></div>
+ </header>
+
+ <div class="stage sleeping" id="stage">
+  <video id="vid" autoplay muted playsinline></video>
+  <div class="overlay"><img src="sleep.svg" alt="Robot in sleep mode"></div>
+  <div class="povr">🔌 Connection released<span>The robot is free for the Enabot app.<br>Tap “Reconnect panel” to use it here again.</span></div>
+ </div>
+
+ <div class="grid4">
+  <button class="act" onclick="act('wake')"><b>☀️</b>Wake</button>
+  <button class="act" onclick="act('sleep')"><b>🌙</b>Sleep</button>
+  <button class="act" onclick="act('dock')"><b>🏠</b>Dock</button>
+  <button class="act" onclick="act('undock')"><b>✋</b>Stop dock</button>
+ </div>
+
+ <button class="conn" id="connbtn" onclick="toggleConn()">🔌 Release for the Enabot app</button>
+
+ <div class="card">
+  <div class="joy" id="joy"><div class="knob" id="knob"></div></div>
+  <div class="hint">Hold &amp; drag to drive — direction = 360°, distance = speed</div>
+  <label class="speed">Max speed <input type="range" id="speed" min="0.2" max="1" step="0.05" value="0.7"><b id="spv">0.70</b></label>
+ </div>
+
+ <details class="acc">
+  <summary>Functions</summary>
+  <div class="accbody"><div class="tgs">
+   <button class="tg" data-f="eyes" onclick="tog('eyes')">👀 Eye lights</button>
+   <button class="tg" data-f="night" onclick="tog('night')">🌗 Night vision</button>
+   <button class="tg" data-f="avoid" onclick="tog('avoid')">🛡️ Anti-collision</button>
+   <button class="tg" data-f="fall" onclick="tog('fall')">🪜 Fall protect</button>
+   <button class="tg" data-f="patrol" onclick="tog('patrol')">👮 Patrol</button>
+  </div></div>
+ </details>
+
+ <details class="acc">
+  <summary>Arrow pad &amp; keyboard</summary>
+  <div class="accbody"><div class="pad">
+   <div class="btn empty"></div><div class="btn" data-dir="fwd">▲</div><div class="btn empty"></div>
+   <div class="btn" data-dir="left">◀</div><div class="btn" data-dir="stop">■</div><div class="btn" data-dir="right">▶</div>
+   <div class="btn empty"></div><div class="btn" data-dir="back">▼</div><div class="btn empty"></div>
+  </div></div>
+ </details>
+
+ <div class="diag" id="stat"></div>
+</div>
+<script>
+// ---- WebRTC stream lifecycle (WebRTC on LAN, HLS fallback when remote via the tunnel) ----
+const vid=document.getElementById('vid'), stage=document.getElementById('stage');
+let pc=null, streaming=false, starting=false, mode=null, iceTimer=null;
+async function startStream(){
+ if(streaming||starting||mode==='hls') return; starting=true;
+ const p=new RTCPeerConnection();
+ p.addTransceiver('video',{direction:'recvonly'});
+ p.ontrack=e=>{vid.srcObject=e.streams[0]; vid.muted=true;};
+ p.oniceconnectionstatechange=()=>{const s=p.iceConnectionState;
+  if(s==='connected'||s==='completed'){mode='webrtc'; if(iceTimer){clearTimeout(iceTimer);iceTimer=null;}}
+  else if(s==='failed'){startHls();}};
+ try{
+  await p.setLocalDescription(await p.createOffer());
+  await new Promise(res=>{if(p.iceGatheringState==='complete')return res();const t=setTimeout(res,1500);
+   p.addEventListener('icegatheringstatechange',()=>{if(p.iceGatheringState==='complete'){clearTimeout(t);res()}})});
+  const resp=await fetch('whep',{method:'POST',headers:{'Content-Type':'application/sdp'},body:p.localDescription.sdp});
+  if(!resp.ok) throw new Error('whep '+resp.status);
+  await p.setRemoteDescription({type:'answer',sdp:await resp.text()});
+  pc=p; streaming=true;
+  if(iceTimer)clearTimeout(iceTimer);
+  iceTimer=setTimeout(()=>{ if(mode!=='webrtc') startHls(); }, 6000);   // remote -> HLS
+ }catch(e){ // transient (e.g. stream not ready right after wake): reset and let the poll retry
+            // WebRTC. Do NOT fall back to HLS here — that only happens on real ICE failure (remote).
+   try{p.close()}catch(_){}; streaming=false; mode=null; }
+ finally{ starting=false; }
+}
+function startHls(){
+ if(mode==='hls') return; mode='hls';
+ if(iceTimer){clearTimeout(iceTimer);iceTimer=null;}
+ try{pc&&pc.close()}catch(_){}; pc=null; streaming=false;
+ try{vid.srcObject=null}catch(_){};
+ vid.src='hls/ebo/index.m3u8'; vid.muted=true;
+ const p=vid.play&&vid.play(); if(p&&p.catch)p.catch(()=>{});
+}
+function stopStream(){
+ streaming=false; mode=null;
+ if(iceTimer){clearTimeout(iceTimer);iceTimer=null;}
+ try{pc&&pc.close()}catch(_){}; pc=null;
+ try{vid.srcObject=null; vid.removeAttribute('src'); vid.load&&vid.load();}catch(_){}
+}
+
+// ---- Controls ----
+let speed=0.7; const spd=document.getElementById('speed'), spv=document.getElementById('spv');
+spd.oninput=()=>{speed=parseFloat(spd.value);spv.textContent=speed.toFixed(2)};
+const P={'Content-Type':'application/json'};
+function move(ly,rx,dur=0.4){fetch('move',{method:'POST',headers:P,body:JSON.stringify({ly,rx,duration:dur})})}
+function stopMove(){fetch('stop',{method:'POST'})}
+function act(n){fetch('action/'+n,{method:'POST'})}
+const ts={}; function tog(f){ts[f]=!ts[f];fetch('action/'+f+'_'+(ts[f]?'on':'off'),{method:'POST'});event.currentTarget.classList.toggle('on',ts[f])}
+const D={fwd:()=>move(speed,0),back:()=>move(-speed,0),left:()=>move(0,-speed),right:()=>move(0,speed),stop:stopMove};
+
+// ---- Analog joystick: direction = 360°, distance from center = speed (scaled by Max speed) ----
+const joy=document.getElementById('joy'), knob=document.getElementById('knob');
+const JR=68;                 // max knob travel (px) from center  (joy radius 115 - knob radius 45)
+let joyOn=false, joyVec={ly:0,rx:0}, joyTimer=null;
+function setKnob(dx,dy){knob.style.transform=`translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;}
+function joyCalc(e){
+ const r=joy.getBoundingClientRect(), cx=r.left+r.width/2, cy=r.top+r.height/2;
+ let dx=e.clientX-cx, dy=e.clientY-cy; const d=Math.hypot(dx,dy);
+ if(d>JR){dx=dx/d*JR; dy=dy/d*JR;}
+ setKnob(dx,dy);
+ joyVec={rx:+(dx/JR*speed).toFixed(3), ly:+(-dy/JR*speed).toFixed(3)};   // up = forward
+}
+function joyDrive(){ if(joyOn) fetch('drive',{method:'POST',headers:P,body:JSON.stringify(joyVec)}); }
+joy.addEventListener('pointerdown',e=>{joyOn=true; joy.classList.add('drag');
+ try{joy.setPointerCapture(e.pointerId)}catch(_){}; joyCalc(e); joyDrive();
+ if(!joyTimer) joyTimer=setInterval(joyDrive,66);          // ~15 Hz while held
+});
+joy.addEventListener('pointermove',e=>{ if(joyOn) joyCalc(e); });
+function joyEnd(){ if(!joyOn) return; joyOn=false; joy.classList.remove('drag');
+ if(joyTimer){clearInterval(joyTimer);joyTimer=null;}
+ joyVec={ly:0,rx:0}; setKnob(0,0); stopMove();             // snap back + stop
+}
+joy.addEventListener('pointerup',joyEnd);
+joy.addEventListener('pointercancel',joyEnd);
+joy.addEventListener('lostpointercapture',joyEnd);
+
+// On-screen d-pad: tap = single pulse, hold = repeat until release.
+document.querySelectorAll('.btn[data-dir]').forEach(b=>{const fn=D[b.dataset.dir];let t=null;
+ const s=e=>{e.preventDefault();fn();if(b.dataset.dir!=='stop')t=setInterval(fn,350)};const e=()=>{if(t){clearInterval(t);t=null}};
+ b.addEventListener('mousedown',s);b.addEventListener('touchstart',s,{passive:false});b.addEventListener('mouseup',e);b.addEventListener('mouseleave',e);b.addEventListener('touchend',e)});
+
+// Keyboard: arrow keys = hold to drive (repeat while held), release = stop. Space = stop now.
+const KEYMAP={ArrowUp:'fwd',ArrowDown:'back',ArrowLeft:'left',ArrowRight:'right'};
+const held={};
+document.addEventListener('keydown',e=>{
+ if(e.key===' '){e.preventDefault();stopMove();return;}
+ const dir=KEYMAP[e.key]; if(!dir) return; e.preventDefault();
+ if(held[dir]) return; D[dir](); held[dir]=setInterval(D[dir],350);
+});
+document.addEventListener('keyup',e=>{
+ const dir=KEYMAP[e.key]; if(!dir) return; e.preventDefault();
+ if(held[dir]){clearInterval(held[dir]);delete held[dir];}
+ if(Object.keys(held).length===0) stopMove();
+});
+window.addEventListener('blur',()=>{ for(const k in held){clearInterval(held[k]);delete held[k];} stopMove(); });
+
+// ---- Robot connection toggle: release the single P2P session for the native Enabot app ----
+const connbtn=document.getElementById('connbtn'), dot=document.getElementById('dot'),
+      stateEl=document.getElementById('state'), battEl=document.getElementById('batt'), statEl=document.getElementById('stat');
+let curPaused=false;
+function toggleConn(){ connbtn.disabled=true;
+ fetch('connection/'+(curPaused?'start':'stop'),{method:'POST'}).finally(()=>setTimeout(()=>connbtn.disabled=false,800)); }
+
+// ---- Status poll: drives stream start/stop, sleep overlay, status chips, connection toggle ----
+async function r(){try{const d=await(await fetch('info')).json();
+ curPaused=!!d.paused;
+ const st = d.paused?['Released','s-rel']:(!d.connected?['Offline','s-off']:(d.awake?['Live','s-live']:['Sleep','s-slp']));
+ stateEl.textContent=st[0]; stateEl.className='chip '+st[1];
+ dot.style.color = d.paused?'#9aa0aa':(d.connected?(d.awake?'#2ecc71':'#eab308'):'#e74c3c');
+ dot.style.background='currentColor';
+ battEl.textContent=(d.charge>0?'⚡ ':'🔋 ')+(d.battery>=0?d.battery+'%':'—');
+ statEl.textContent='RX '+d.frames_received+' · '+(d.codec||'—');
+ connbtn.textContent=d.paused?'🔗 Reconnect panel':'🔌 Release for the Enabot app';
+ connbtn.classList.toggle('on',d.paused);
+ if(d.paused){ stage.classList.add('paused'); stage.classList.remove('sleeping'); if(streaming||pc||mode) stopStream(); }
+ else { stage.classList.remove('paused');
+  if(d.awake){ stage.classList.remove('sleeping'); if(!streaming&&!starting&&mode!=='hls') startStream(); }
+  else { stage.classList.add('sleeping'); if(streaming||pc||mode) stopStream(); } }
+}catch(e){ dot.style.color='#e74c3c'; dot.style.background='currentColor'; stateEl.textContent='Offline'; stateEl.className='chip s-off'; }}
+setInterval(r,1500);r();
+</script></body></html>

@@ -1,0 +1,18 @@
+# mediamtx config template. run.sh substitutes __STREAM_USER__ / __STREAM_PASS__ at startup.
+# Serves the robot video as RTSP (:8554), WebRTC (:8889) and HLS (:8888), all behind auth.
+logLevel: error
+hlsVariant: lowLatency
+hlsAlwaysRemux: yes
+
+# Authentication: a single account that may both publish (ffmpeg) and read (Home Assistant / browser).
+authInternalUsers:
+  - user: __STREAM_USER__
+    pass: __STREAM_PASS__
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+
+paths:
+  ebo:
+    source: publisher
