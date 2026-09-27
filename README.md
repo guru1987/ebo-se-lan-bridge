@@ -95,9 +95,8 @@ to be validated on that host.
 
 ## Credits
 
-Prepared collaboratively by:
-
-- GPT-5.6-Sol by OpenAI
+- **Original project and core bridge:** [lilium360](https://github.com/lilium360)
+- **Two-way audio research and implementation:** GPT-5.6-Sol by OpenAI
 - Opus 5.5 by Anthropic
 - [Same Sun Foundation](https://www.samesun.foundation)
 - From Porch in Nuremberg, by Brothers: Grandpa, Phil, Ghost, Fourth
