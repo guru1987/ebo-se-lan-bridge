@@ -4,12 +4,18 @@ logLevel: error
 hlsVariant: lowLatency
 hlsAlwaysRemux: yes
 
-# Authentication: a single account that may both publish (ffmpeg) and read (Home Assistant / browser).
+# The local ffmpeg publisher is anonymous only from loopback, so its credentials never
+# appear in process arguments. Remote readers still require the generated account.
 authInternalUsers:
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+        path: ebo
   - user: __STREAM_USER__
     pass: __STREAM_PASS__
     permissions:
-      - action: publish
       - action: read
       - action: playback
 

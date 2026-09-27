@@ -1,11 +1,12 @@
 # EBO-SE Bridge
 
 A **phone-free** bridge for the **Enabot EBO SE** robot. It runs the official TUTK/Kalay
-libraries on a Raspberry Pi and exposes the robot to **Home Assistant** as a camera and a
+libraries on an ARM Linux host and exposes the robot to **Home Assistant** as a camera and a
 set of native entities — **no phone, no ROLA app, no cloud account online** required for use.
 
 It connects directly to the robot over the LAN (Kalay P2P + DTLS-PSK), receives the live
-**H.265 1080p30 video** with **G.711 audio (listen-only)**, and lets you **drive it and
+**H.265 1080p30 video** with **G.711 microphone audio**, provides **push-to-talk audio to
+the robot speaker**, and lets you **drive it and
 control it** (analog joystick + d-pad, dock, wake/sleep, eye lights, night vision,
 collision/fall protection, patrol), with **battery** and **diagnostic** sensors.
 
@@ -14,22 +15,23 @@ collision/fall protection, patrol), with **battery** and **diagnostic** sensors.
 
 ## How it works
 
-Home Assistant runs on a separate machine (often x86); the bridge runs on a Raspberry Pi
-(ARM), because the TUTK libraries are 32-bit ARM/Android. HA integrates over the LAN.
+Home Assistant can run on a separate machine (often x86); the bridge runs on an ARM host
+with a native bridge, bionic runtime and owned TUTK libraries of one matching ABI. The
+original deployment is ARM32; ARM64 is supported for hardware such as the ODROID-C2.
 
 ```
- Robot ──Kalay P2P / DTLS──► ebo_bridge (native, bionic)
-                                 │ H.265 video            ▲ control (fd3, RDT/MAVLink)
-                                 ▼                        │
+ Robot ◄──Kalay P2P / DTLS──► ebo_bridge (native, bionic)
+                                 │ H.265/G.711             ▲ control + speaker PCM (fd3)
+                                 ▼                         │
                             ffmpeg -c copy ──► mediamtx (RTSP/WebRTC/HLS)
                                  │                        │
    Home Assistant ◄── RTSP camera ──┘     MQTT entities ──┴── ebo_server.py (supervisor)
    (on your mini-PC)  ◄── MQTT discovery ──────────────────────────┘
 ```
 
-- **The Pi holds all the secrets.** Home Assistant only talks to MQTT (entities) and pulls
+- **The bridge host holds all the secrets.** Home Assistant only talks to MQTT (entities) and pulls
   the RTSP stream. It never authenticates with the robot.
-- **Video is passthrough** (`ffmpeg -c:v copy`): the Pi does *no* decoding/transcoding
+- **Video is passthrough** (`ffmpeg -c:v copy`): the bridge host does *no* decoding/transcoding
   (~5% CPU). The viewer (browser / HA) decodes HEVC in hardware.
 - **Battery/status** comes from the robot over the reliable channel (`RDT_Read`).
 
@@ -44,9 +46,9 @@ Home Assistant runs on a separate machine (often x86); the bridge runs on a Rasp
 | `app/mediamtx.template.yml` | RTSP/WebRTC/HLS server config (auth injected at start) |
 | `app/run.sh` | container entrypoint |
 | `Dockerfile`, `docker-compose.yml` | packaging |
-| `vendor/` | **you provide**: TUTK `.so`, bionic runtime, `ioctl9930.bin` (gitignored) |
+| `vendor/` | **you provide**: TUTK `.so`, bionic runtime, optional `ioctl9930.bin` (gitignored) |
 
-## Quick start (Raspberry Pi)
+## Quick start (ARM host)
 
 ```bash
 git clone <this-repo> && cd ebo-se-bridge
@@ -64,20 +66,32 @@ Then in Home Assistant: **Settings → Devices & Services → Add Integration �
 Add the camera with **Generic Camera** → `rtsp://<stream_user>:<stream_pass>@<pi-ip>:8554/ebo`.
 Full guide: [docs/HOME_ASSISTANT.md](docs/HOME_ASSISTANT.md).
 
-The web panel (manual driving) binds to `127.0.0.1:8000` by default and is meant to be
+The web panel (video, manual driving and hold-to-talk) binds to `127.0.0.1:8000` by default and is meant to be
 exposed over **HTTPS** via a reverse proxy or **Cloudflare Tunnel** (so it can be embedded in
 an HTTPS Home Assistant dashboard without mixed-content errors). To reach it directly on the
 LAN over plain HTTP instead, set `EBO_BIND=0.0.0.0` and open `http://<pi-ip>:8000`.
 
+Browser microphone capture requires a secure context: use HTTPS, or `localhost` while
+developing. Talkback accepts one browser under the panel's configured access policy at a
+time and always sends the native
+speaker STOP command when the button is released or the WebSocket disconnects. See
+[docs/TALKBACK.md](docs/TALKBACK.md) for the tested wire format and validation notes.
+For an x86-64, non-Docker deployment see [docs/HOST_QEMU.md](docs/HOST_QEMU.md).
+
 ## Security
 
 RTSP, WebRTC, the web panel and MQTT are all authenticated (credentials in `.env`).
-Keep the Pi on a trusted network; the stream/control are only as private as those credentials.
+Keep the bridge host on a trusted network; the stream/control are only as private as those credentials.
+The local ffmpeg publisher is admitted anonymously only from loopback, keeping reader
+credentials out of process arguments.
 
 ## Status
 
-Working and tested on a Raspberry Pi 4: video (RTSP, fluid), full control, battery and
-diagnostics, all as native Home Assistant entities.
+Video, robot microphone audio, control, battery and diagnostics have been tested on the
+original ARM32 Raspberry Pi path. The new speaker path was live-tested with the owned ARM64
+ROLA libraries on a rooted Pixel 3: channel 2 became ready, audio frames were accepted, STOP
+completed, and the process exited cleanly. The ARM64 ODROID-C2 container deployment remains
+to be validated on that host.
 
 ## Legal & disclaimer
 

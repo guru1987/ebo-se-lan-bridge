@@ -13,4 +13,7 @@ vendor/ioctl9930.bin
 # build artifacts
 *.tar.gz
 mediamtx
+app/ebo_bridge-*
+auto.crt
+auto.key
 __pycache__/

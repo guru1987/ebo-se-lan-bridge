@@ -40,6 +40,10 @@
        font-size:14px;font-weight:600;background:var(--card);color:var(--fg);border:1px solid var(--line)}
  .conn:active{transform:scale(.99)} .conn.on{background:var(--rel);border-color:var(--rel);color:#160d03}
  .conn[disabled]{opacity:.5}
+ .talk{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;padding:14px;border-radius:14px;cursor:pointer;
+       touch-action:none;font-size:15px;font-weight:700;background:#183154;color:#eaf2ff;border:1px solid #315d96}
+ .talk:active,.talk.connecting{transform:scale(.99);background:#214777}.talk.live{background:var(--bad);border-color:var(--bad);color:#fff}
+ .talk[disabled]{opacity:.45;cursor:not-allowed}.talk small{font-size:11px;font-weight:500;opacity:.8}
  /* joystick card */
  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px}
  .joy{width:230px;height:230px;border-radius:50%;margin:2px auto 0;position:relative;touch-action:none;cursor:grab;
@@ -87,6 +91,7 @@
  </div>
 
  <button class="conn" id="connbtn" onclick="toggleConn()">🔌 Release for the Enabot app</button>
+ <button class="talk" id="talkbtn"><span>🎙️</span><span id="talklabel">Hold to talk</span></button>
 
  <div class="card">
   <div class="joy" id="joy"><div class="knob" id="knob"></div></div>
@@ -214,6 +219,66 @@ document.addEventListener('keyup',e=>{
 });
 window.addEventListener('blur',()=>{ for(const k in held){clearInterval(held[k]);delete held[k];} stopMove(); });
 
+// ---- Push-to-talk: microphone -> 8 kHz mono PCM16 -> authenticated same-origin WebSocket ----
+const talkbtn=document.getElementById('talkbtn'), talklabel=document.getElementById('talklabel');
+let talkWanted=false,talkSocket=null,talkStream=null,talkCtx=null,talkSource=null,talkProcessor=null,talkSilent=null;
+function talkUi(state,text){talkbtn.classList.toggle('connecting',state==='connecting');talkbtn.classList.toggle('live',state==='live');talklabel.textContent=text;}
+function pcm8k(input,inRate){
+ const count=Math.max(1,Math.floor(input.length*8000/inRate)), out=new Int16Array(count), ratio=inRate/8000;
+ for(let i=0;i<count;i++){
+  const a=Math.floor(i*ratio),b=Math.max(a+1,Math.min(input.length,Math.floor((i+1)*ratio)));let sum=0;
+  for(let j=a;j<b;j++)sum+=input[j];
+  const s=Math.max(-1,Math.min(1,sum/(b-a)));out[i]=s<0?s*32768:s*32767;
+ }
+ return out;
+}
+function releaseTalkMedia(){
+ if(talkProcessor){talkProcessor.onaudioprocess=null;try{talkProcessor.disconnect()}catch(_){}} talkProcessor=null;
+ if(talkSource){try{talkSource.disconnect()}catch(_){}} talkSource=null;
+ if(talkSilent){try{talkSilent.disconnect()}catch(_){}} talkSilent=null;
+ if(talkStream){talkStream.getTracks().forEach(t=>t.stop())} talkStream=null;
+ if(talkCtx){try{talkCtx.close()}catch(_){}} talkCtx=null;
+}
+function stopTalk(){
+ talkWanted=false;releaseTalkMedia();
+ const ws=talkSocket;talkSocket=null;if(ws&&ws.readyState<2)try{ws.close(1000,'released')}catch(_){}
+ talkUi('idle','Hold to talk');
+}
+async function startTalk(e){
+ if(e)e.preventDefault();if(talkWanted||talkbtn.disabled)return;
+ talkWanted=true;talkUi('connecting','Connecting speaker…');
+ try{
+  talkCtx=new (window.AudioContext||window.webkitAudioContext)();await talkCtx.resume();
+  talkStream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+  if(!talkWanted){stopTalk();return}
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  const ws=new WebSocket(proto+'//'+location.host+'/ws/talk');talkSocket=ws;
+  ws.onopen=()=>{if(!talkWanted)try{ws.close(1000,'released')}catch(_){}};
+  ws.onmessage=ev=>{
+   let msg;try{msg=JSON.parse(ev.data)}catch(_){return}
+   if(msg.type==='error'){talkUi('idle','Speaker unavailable');stopTalk();return}
+   if(msg.type!=='ready'||!talkWanted)return;
+   talkSource=talkCtx.createMediaStreamSource(talkStream);
+   talkProcessor=talkCtx.createScriptProcessor(2048,1,1);
+   talkSilent=talkCtx.createGain();talkSilent.gain.value=0;
+   talkProcessor.onaudioprocess=audio=>{
+    if(!talkWanted||ws.readyState!==WebSocket.OPEN)return;
+    const pcm=pcm8k(audio.inputBuffer.getChannelData(0),talkCtx.sampleRate);
+    for(let offset=0;offset<pcm.length&&ws.bufferedAmount<4096;offset+=640){
+     const part=pcm.subarray(offset,Math.min(offset+640,pcm.length));ws.send(part.slice().buffer);
+    }
+   };
+   talkSource.connect(talkProcessor);talkProcessor.connect(talkSilent);talkSilent.connect(talkCtx.destination);
+   talkUi('live','Talking — release to stop');
+  };
+  ws.onerror=()=>{if(talkWanted)talkUi('idle','Talk connection failed')};
+  ws.onclose=()=>{if(talkSocket===ws){talkSocket=null;if(talkWanted)stopTalk()}};
+ }catch(err){stopTalk();talkUi('idle',err&&err.name==='NotAllowedError'?'Microphone permission denied':'Talk unavailable')}
+}
+talkbtn.addEventListener('pointerdown',e=>{try{talkbtn.setPointerCapture(e.pointerId)}catch(_){}startTalk(e)});
+talkbtn.addEventListener('pointerup',stopTalk);talkbtn.addEventListener('pointercancel',stopTalk);talkbtn.addEventListener('lostpointercapture',stopTalk);
+talkbtn.addEventListener('contextmenu',e=>e.preventDefault());window.addEventListener('pagehide',stopTalk);
+
 // ---- Robot connection toggle: release the single P2P session for the native Enabot app ----
 const connbtn=document.getElementById('connbtn'), dot=document.getElementById('dot'),
       stateEl=document.getElementById('state'), battEl=document.getElementById('batt'), statEl=document.getElementById('stat');
@@ -232,10 +297,12 @@ async function r(){try{const d=await(await fetch('info')).json();
  statEl.textContent='RX '+d.frames_received+' · '+(d.codec||'—');
  connbtn.textContent=d.paused?'🔗 Reconnect panel':'🔌 Release for the Enabot app';
  connbtn.classList.toggle('on',d.paused);
+ talkbtn.disabled=d.paused||!d.connected;
+ if(talkbtn.disabled&&talkWanted)stopTalk();
  if(d.paused){ stage.classList.add('paused'); stage.classList.remove('sleeping'); if(streaming||pc||mode) stopStream(); }
  else { stage.classList.remove('paused');
   if(d.awake){ stage.classList.remove('sleeping'); if(!streaming&&!starting&&mode!=='hls') startStream(); }
   else { stage.classList.add('sleeping'); if(streaming||pc||mode) stopStream(); } }
-}catch(e){ dot.style.color='#e74c3c'; dot.style.background='currentColor'; stateEl.textContent='Offline'; stateEl.className='chip s-off'; }}
+}catch(e){ talkbtn.disabled=true;if(talkWanted)stopTalk();dot.style.color='#e74c3c'; dot.style.background='currentColor'; stateEl.textContent='Offline'; stateEl.className='chip s-off'; }}
 setInterval(r,1500);r();
 </script></body></html>

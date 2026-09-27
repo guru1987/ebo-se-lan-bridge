@@ -14,10 +14,10 @@ Other:         EBO_DIR (/opt/ebo)  EBO_PORT (8000)  EBO_BIND (127.0.0.1)
 """
 import os, time, struct, threading, subprocess, secrets, socket, base64, urllib.request, urllib.error, http.cookiejar
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.concurrency import run_in_threadpool
+from starlette.requests import HTTPConnection
 from pydantic import BaseModel
 import uvicorn
 
@@ -140,6 +140,10 @@ class Bridge:
         os.set_blocking(self._a_w, False)   # never block: drop audio if ffmpeg lags
         self._a_buf = bytearray()           # jitter buffer for robot audio
         self._a_lock = threading.Lock()
+        self._ctrl_lock = threading.Lock()  # keep fd3 frames atomic across HTTP/WebSocket threads
+        self._speaker_ready = threading.Event()
+        self._speaker_error = None
+        self._speaker_state_lock = threading.Lock()
         self._running = True
         self._ff_primed = False   # becomes True once ffmpeg has been fed an HEVC keyframe
         self.paused = False       # when True the native bridge is stopped, freeing the robot for the app
@@ -148,7 +152,7 @@ class Bridge:
         self._start_ffmpeg()
         self._start_bridge()
         threading.Thread(target=self._read_frames, daemon=True).start()
-        threading.Thread(target=self._log_stderr, daemon=True).start()
+        threading.Thread(target=self._log_stderr, args=(self.proc,), daemon=True).start()
         if AUDIO_ON:
             threading.Thread(target=self._audio_feeder, daemon=True).start()
 
@@ -181,12 +185,13 @@ class Bridge:
 
     def _start_mediamtx(self):
         self.mtx = subprocess.Popen([os.path.join(EBO_DIR, "mediamtx"), os.path.join(EBO_DIR, "mediamtx.yml")],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    cwd=EBO_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("[supervisor] mediamtx pid", self.mtx.pid, flush=True)
 
     def _start_ffmpeg(self):
-        auth = f"{STREAM_USER}:{STREAM_PASS}@" if STREAM_PASS else ""
-        url = f"rtsp://{auth}127.0.0.1:8554/{RTSP_PATH}"
+        # MediaMTX permits anonymous publishing only from loopback. Keep reader
+        # credentials out of ffmpeg's process arguments and /proc command line.
+        url = f"rtsp://127.0.0.1:8554/{RTSP_PATH}"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
                "-fflags", "nobuffer", "-flags", "low_delay",
                "-analyzeduration", "500000", "-probesize", "1000000",
@@ -225,14 +230,22 @@ class Bridge:
 
     def _start_bridge(self):
         linker = os.path.join(EBO_DIR, "bionic", "linker")
-        bridge = os.path.abspath(os.path.join(EBO_DIR, "ebo_bridge"))
+        bridge_name = os.environ.get("EBO_BRIDGE_BIN", "ebo_bridge")
+        if os.path.basename(bridge_name) != bridge_name:
+            raise ValueError("EBO_BRIDGE_BIN must be a filename")
+        bridge = os.path.abspath(os.path.join(EBO_DIR, bridge_name))
+        qemu = os.environ.get("EBO_QEMU")
+        command = [qemu, linker, bridge] if qemu else [linker, bridge]
         env = dict(os.environ)
         env["EBO_LIB_DIR"] = os.path.join(EBO_DIR, "lib")
         env["EBO_IOCTL9930"] = os.path.join(EBO_DIR, "ioctl9930.bin")
         env["LD_LIBRARY_PATH"] = os.path.join(EBO_DIR, "bionic") + ":" + os.path.join(EBO_DIR, "lib")
-        self.proc = subprocess.Popen([linker, bridge], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        self.proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     env=env, pass_fds=(self._ctrl_r,),
                                     preexec_fn=lambda: os.dup2(self._ctrl_r, 3))
+        with self._speaker_state_lock:
+            self._speaker_error = None
+            self._speaker_ready.clear()
         print("[supervisor] bridge pid", self.proc.pid, flush=True)
 
     def pause_bridge(self):
@@ -242,6 +255,8 @@ class Bridge:
             return
         self.paused = True
         self.connected = False
+        try: self.speaker_stop()
+        except Exception: pass
         print("[supervisor] pausing bridge (releasing robot for the app)", flush=True)
         try: self.proc.terminate()
         except Exception: pass
@@ -259,14 +274,28 @@ class Bridge:
         print("[supervisor] resuming bridge", flush=True)
         self._start_bridge()
         threading.Thread(target=self._read_frames, daemon=True).start()
-        threading.Thread(target=self._log_stderr, daemon=True).start()
+        threading.Thread(target=self._log_stderr, args=(self.proc,), daemon=True).start()
 
-    def _log_stderr(self):
-        for line in iter(self.proc.stderr.readline, b""):
+    def _log_stderr(self, proc):
+        for line in iter(proc.stderr.readline, b""):
             s = line.decode(errors="replace").rstrip()
             print("[bridge]", s, flush=True)
             if "connected" in s:
                 self.connected = True
+            if "speaker ready " in s:
+                with self._speaker_state_lock:
+                    self._speaker_error = None
+                    self._speaker_ready.set()
+            elif "avServStartEx speaker err=" in s:
+                with self._speaker_state_lock:
+                    self._speaker_error = s.rsplit("=", 1)[-1]
+                    self._speaker_ready.set()
+        if proc is self.proc:
+            self.connected = False
+            with self._speaker_state_lock:
+                if not self._speaker_ready.is_set():
+                    self._speaker_error = "bridge disconnected"
+                    self._speaker_ready.set()
 
     def _read_frames(self):
         f = self.proc.stdout
@@ -322,12 +351,55 @@ class Bridge:
             else:
                 i += 1
 
+    def _send_command(self, kind: int, data: bytes = b""):
+        if not 0 <= kind <= 255:
+            raise ValueError("invalid command kind")
+        payload = bytes((kind,)) + data
+        framed = struct.pack("<I", len(payload)) + payload
+        with self._ctrl_lock:
+            view = memoryview(framed)
+            while view:
+                written = os.write(self._ctrl_w, view)
+                if written <= 0:
+                    raise BrokenPipeError("bridge control pipe closed")
+                view = view[written:]
+
     def send_rdt(self, mavlink: bytes):
-        os.write(self._ctrl_w, struct.pack("<I", 1 + len(mavlink)) + b"\x00" + mavlink)
+        self._send_command(0, mavlink)
 
     def send_ioctl(self, io_type: int, data: bytes = b""):
-        payload = b"\x01" + struct.pack("<H", io_type) + data
-        os.write(self._ctrl_w, struct.pack("<I", len(payload)) + payload)
+        self._send_command(1, struct.pack("<H", io_type) + data)
+
+    def speaker_start(self, timeout: float = 12.0):
+        if self.paused or not self.proc or self.proc.poll() is not None:
+            raise RuntimeError("bridge is not running")
+        with self._speaker_state_lock:
+            self._speaker_error = None
+            self._speaker_ready.clear()
+        self._send_command(2)
+        if not self._speaker_ready.wait(timeout):
+            try: self._send_command(4)
+            except Exception: pass
+            raise TimeoutError("speaker start timed out")
+        with self._speaker_state_lock:
+            error = self._speaker_error
+        if error:
+            try: self._send_command(4)
+            except Exception: pass
+            raise RuntimeError(f"speaker start failed ({error})")
+
+    def speaker_send_pcm(self, pcm16le: bytes):
+        if not pcm16le or len(pcm16le) > 1280 or len(pcm16le) % 2:
+            raise ValueError("PCM must be even-length, nonempty, and at most 1280 bytes")
+        self._send_command(3, pcm16le)
+
+    def speaker_stop(self):
+        try:
+            self._send_command(4)
+        finally:
+            with self._speaker_state_lock:
+                self._speaker_error = None
+                self._speaker_ready.clear()
 
 
 # ---------------- actions (shared by REST + MQTT) ----------------
@@ -352,15 +424,28 @@ def do_move(ly: float, rx: float, duration: float = 0.4):
 
 # ---------------- HTTP API + web panel (optional basic auth) ----------------
 bridge = None
-_basic = HTTPBasic(auto_error=False)
+_talk_owner = threading.Lock()
 
-def require_auth(request: Request, cred: HTTPBasicCredentials = Depends(_basic)):
-    if request.url.path == "/sleep.svg":   # public: harmless fallback graphic, usable as a card image
+def _valid_basic_auth(header: str | None) -> bool:
+    if not WEB_USER:
+        return True
+    try:
+        scheme, encoded = (header or "").split(" ", 1)
+        if scheme.lower() != "basic":
+            return False
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except (ValueError, UnicodeError):
+        return False
+    return (secrets.compare_digest(username, WEB_USER) and
+            secrets.compare_digest(password, WEB_PASS or ""))
+
+def require_auth(connection: HTTPConnection):
+    if connection.scope["type"] == "websocket":
+        return  # WebSockets are checked explicitly before accept().
+    if connection.url.path == "/sleep.svg":   # public: harmless fallback graphic, usable as a card image
         return
-    if not WEB_USER:           # auth disabled when no user configured
-        return
-    ok = cred and secrets.compare_digest(cred.username, WEB_USER) and secrets.compare_digest(cred.password, WEB_PASS or "")
-    if not ok:
+    if not _valid_basic_auth(connection.headers.get("authorization")):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
 
 app = FastAPI(dependencies=[Depends(require_auth)])
@@ -499,6 +584,56 @@ def connection(state: str):
     else:
         return {"ok": False, "err": "unknown"}
     return {"ok": True, "paused": bridge.paused}
+
+
+@app.websocket("/ws/talk")
+async def talk(websocket: WebSocket):
+    if not _valid_basic_auth(websocket.headers.get("authorization")):
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+    if not _talk_owner.acquire(blocking=False):
+        await websocket.close(code=4409, reason="Talkback already in use")
+        return
+
+    started = False
+    try:
+        await websocket.accept()
+        if not bridge or bridge.paused:
+            await websocket.send_json({"type": "error", "error": "bridge unavailable"})
+            await websocket.close(code=1013)
+            return
+        try:
+            await run_in_threadpool(bridge.speaker_start, 12.0)
+            started = True
+        except Exception as exc:
+            print("[supervisor] talkback start failed:", type(exc).__name__, flush=True)
+            await websocket.send_json({"type": "error", "error": "speaker start failed"})
+            await websocket.close(code=1011)
+            return
+
+        await websocket.send_json({"type": "ready", "format": "pcm_s16le", "rate": 8000,
+                                   "channels": 1, "max_bytes": 1280})
+        # At 8 kHz mono PCM16 the natural rate is 16 kB/s. Allow a 200 ms burst,
+        # then reject clients that continuously outrun real time.
+        budget = 3200.0
+        last = time.monotonic()
+        while True:
+            pcm = await websocket.receive_bytes()
+            now = time.monotonic()
+            budget = min(3200.0, budget + (now - last) * 16000.0)
+            last = now
+            if not pcm or len(pcm) > 1280 or len(pcm) % 2 or len(pcm) > budget:
+                await websocket.close(code=1008, reason="Invalid PCM stream")
+                return
+            budget -= len(pcm)
+            await run_in_threadpool(bridge.speaker_send_pcm, pcm)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if started and bridge:
+            try: await run_in_threadpool(bridge.speaker_stop)
+            except Exception: pass
+        _talk_owner.release()
 
 
 if __name__ == "__main__":

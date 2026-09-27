@@ -1,7 +1,6 @@
-# EBO-SE bridge — runs on the Raspberry Pi (aarch64). The host kernel must allow 32-bit
-# ARM execution (default on Raspberry Pi OS / HA OS); the bridge is a 32-bit Android
-# binary run through the bundled bionic linker. Only the H.265 passthrough is done here,
-# so a generic ffmpeg (no HW codecs) is enough.
+# EBO-SE bridge for ARM Linux. The native bridge, proprietary TUTK libraries and bundled
+# Android/bionic linker must all have the same ABI (ARM32 or ARM64). Only H.265 passthrough
+# is done here, so a generic ffmpeg (no hardware codecs) is enough.
 ARG BUILD_FROM=python:3.11-slim-bookworm
 FROM ${BUILD_FROM}
 
@@ -29,7 +28,7 @@ COPY vendor/lib/        /opt/ebo/lib/
 COPY vendor/bionic/     /opt/ebo/bionic/
 COPY vendor/ioctl9930.bin /opt/ebo/ioctl9930.bin
 
-RUN chmod +x /opt/ebo/ebo_bridge /opt/ebo/bionic/linker /opt/ebo/run.sh /opt/ebo/mediamtx
+RUN chmod +x /opt/ebo/ebo_bridge* /opt/ebo/bionic/linker /opt/ebo/run.sh /opt/ebo/mediamtx
 
 ENV EBO_DIR=/opt/ebo EBO_PORT=8000
 # 8000 web panel/API · 8554 RTSP · 8889 WebRTC · 8888 HLS
