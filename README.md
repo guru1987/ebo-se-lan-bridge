@@ -93,6 +93,15 @@ ROLA libraries on a rooted Pixel 3: channel 2 became ready, audio frames were ac
 completed, and the process exited cleanly. The ARM64 ODROID-C2 container deployment remains
 to be validated on that host.
 
+## Credits
+
+Prepared collaboratively by:
+
+- GPT-5.6-Sol by OpenAI
+- Opus 5.5 by Anthropic
+- [Same Sun Foundation](https://www.samesun.foundation)
+- From Porch in Nuremberg, by Brothers: Grandpa, Phil, Ghost, Fourth
+
 ## Legal & disclaimer
 
 **Not affiliated.** This is an independent, community project. It is **not** affiliated with,
