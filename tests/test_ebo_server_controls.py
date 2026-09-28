@@ -1,0 +1,138 @@
+import struct
+import sys
+import threading
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
+
+import ebo_server
+from ebo_mavlink import FrameBuilder, MAVLinkV1Stream
+
+
+def state_bridge():
+    bridge = ebo_server.Bridge.__new__(ebo_server.Bridge)
+    bridge.parameters = {}
+    bridge.parameter_meta = {}
+    bridge.telemetry = {}
+    bridge.timed_tasks = {1: {}, 2: {}}
+    bridge._task_list_counts = {1: None, 2: None}
+    bridge.last_task_ack = None
+    bridge._mav_stream = MAVLinkV1Stream()
+    bridge._state_condition = threading.Condition()
+    bridge.on_status = None
+    bridge.on_state = None
+    bridge.battery = -1
+    bridge.charge = -1
+    return bridge
+
+
+class StateDecoderTests(unittest.TestCase):
+    def test_motor_frame_preserves_positive_forward_api_contract(self):
+        frame = MAVLinkV1Stream().feed(ebo_server.motor_frame(ly=0.25, rx=-0.5))[0]
+        self.assertEqual(frame.message_id, 202)
+        lx, ly, rx, ry = struct.unpack_from("<4f", frame.payload)
+        self.assertEqual((lx, ly, rx, ry, frame.payload[16]), (0.0, -0.25, -0.5, 0.0, 0))
+
+    def test_fragmented_parameter_echo_updates_state_and_callback(self):
+        bridge = state_bridge()
+        changes = []
+        bridge.on_state = lambda *change: changes.append(change)
+        payload = (struct.pack("<fHH", 61.0, 2, 1) +
+                   b"audio-volume".ljust(32, b"\0") + b"\x06")
+        frame = FrameBuilder().frame(228, payload)
+        bridge._parse_status(frame[:7])
+        self.assertEqual(bridge.parameters, {})
+        bridge._parse_status(frame[7:])
+        self.assertEqual(bridge.parameters["audio-volume"], 61.0)
+        self.assertEqual(changes[-1], ("parameter", "audio-volume", 61.0))
+
+    def test_battery_details_and_legacy_status_callback(self):
+        bridge = state_bridge()
+        status = []
+        bridge.on_status = lambda battery, charge: status.append((battery, charge))
+        frame = FrameBuilder().frame(207, struct.pack("<4fBB", 8.1, -0.1, 8.0, 8.4, 91, 1))
+        bridge._parse_status(frame)
+        self.assertEqual((bridge.battery, bridge.charge), (91, 1))
+        self.assertEqual(status, [(91, 1)])
+        self.assertAlmostEqual(bridge.telemetry["battery"]["measured_voltage"], 8.1, places=5)
+
+    def test_zero_count_timed_task_item_is_an_empty_list_sentinel(self):
+        bridge = state_bridge()
+        payload = struct.pack("<7i9B", 0, 0, 0, 0, 0, 0, 0,
+                              2, 0, 0, 0, 0, 0, 0, 0, 0)
+        bridge._parse_status(FrameBuilder().frame(154, payload))
+        self.assertEqual(bridge.timed_tasks[2], {})
+        self.assertEqual(bridge._task_list_counts[2], 0)
+
+
+class StatefulParameterTests(unittest.TestCase):
+    def test_write_requires_and_accepts_matching_robot_echo(self):
+        bridge = state_bridge()
+        builder = FrameBuilder()
+
+        def echo(_request):
+            payload = (struct.pack("<fHH", 75.0, 1, 0) +
+                       b"audio-volume".ljust(32, b"\0") + b"\x06")
+            bridge._parse_status(builder.frame(228, payload))
+
+        bridge.send_rdt = echo
+        result = bridge.set_parameter("audio", "volume", 75)
+        self.assertTrue(result["acknowledged"])
+        self.assertEqual(result["value"], 75.0)
+
+    def test_unknown_and_out_of_range_parameters_are_rejected(self):
+        bridge = state_bridge()
+        bridge.send_rdt = lambda _: self.fail("invalid writes must not be sent")
+        with self.assertRaises(ValueError):
+            bridge.set_parameter("not", "real", 1)
+        with self.assertRaises(ValueError):
+            bridge.set_parameter("audio", "volume", 101)
+        with self.assertRaises(ValueError):
+            bridge.set_parameter("security_fixed", "sensitivity", 3)
+        with self.assertRaises(ValueError):
+            bridge.set_parameter("security_fixed", "notify_interval", 61)
+
+
+class ControlAPITests(unittest.TestCase):
+    def test_move_rejects_axes_outside_normalized_range(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        with mock.patch.object(ebo_server, "WEB_USER", None):
+            try:
+                client = TestClient(ebo_server.app)
+            except TypeError as exc:
+                self.skipTest(f"incompatible TestClient: {exc}")
+            response = client.post("/move", json={"ly": 50, "rx": 0, "duration": 0.2})
+        self.assertEqual(response.status_code, 422)
+
+    def test_parameter_put_returns_echoed_robot_state(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        bridge = state_bridge()
+        builder = FrameBuilder()
+
+        def echo(_request):
+            payload = (struct.pack("<fHH", 44.0, 1, 0) +
+                       b"audio-volume".ljust(32, b"\0") + b"\x06")
+            bridge._parse_status(builder.frame(228, payload))
+
+        bridge.send_rdt = echo
+        with mock.patch.object(ebo_server, "bridge", bridge), \
+             mock.patch.object(ebo_server, "WEB_USER", None):
+            try:
+                client = TestClient(ebo_server.app)
+            except TypeError as exc:
+                self.skipTest(f"incompatible TestClient: {exc}")
+            response = client.put("/parameter/audio/volume", json={"value": 44})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["acknowledged"])
+
+
+if __name__ == "__main__":
+    unittest.main()

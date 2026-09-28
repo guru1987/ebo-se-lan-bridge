@@ -111,6 +111,38 @@
  </details>
 
  <details class="acc">
+  <summary>Robot settings</summary>
+  <div class="accbody">
+   <label class="speed">Speaker volume <input class="robot-param" data-param="audio/volume" type="range" min="0" max="100" step="1"><b>—</b></label>
+   <label class="speed">Call volume <input class="robot-param" data-param="audio/call_volume" type="range" min="0" max="100" step="1"><b>—</b></label>
+   <label class="speed">Robot drive speed <input class="robot-param" data-param="control/speed" type="range" min="0" max="100" step="1"><b>—</b></label>
+   <label class="speed">Security sensitivity <input class="robot-param" data-param="security_fixed/sensitivity" type="range" min="0" max="4" step="2"><b>—</b></label>
+   <label class="speed">Notify interval (s) <input class="robot-param" data-param="security_fixed/notify_interval" type="number" min="-1" max="3600" step="1"><b>—</b></label>
+   <label class="speed">Area left <input class="robot-param" data-param="security_fixed/range_point1_x" type="range" min="0" max="100" step="1"><b>—</b></label>
+   <label class="speed">Area top <input class="robot-param" data-param="security_fixed/range_point1_y" type="range" min="0" max="100" step="1"><b>—</b></label>
+   <label class="speed">Area right <input class="robot-param" data-param="security_fixed/range_point2_x" type="range" min="0" max="100" step="1"><b>—</b></label>
+   <label class="speed">Area bottom <input class="robot-param" data-param="security_fixed/range_point2_y" type="range" min="0" max="100" step="1"><b>—</b></label>
+   <div class="tgs" style="margin-top:10px">
+    <button class="tg param-toggle" data-param="security_fixed/enable">📍 Fixed-point guard</button>
+    <button class="tg param-toggle" data-param="security_fixed/notification">🔔 Notifications</button>
+   </div>
+  </div>
+ </details>
+
+ <details class="acc">
+  <summary>Security schedule</summary>
+  <div class="accbody">
+   <div class="hint" style="margin:0 0 10px">Cruise schedules can move the robot autonomously at the chosen time.</div>
+   <label class="speed">Mode <select id="tasktype"><option value="1">Fixed point</option><option value="2">Cruise</option></select></label>
+   <label class="speed">Start <input id="taskstart" type="time" value="12:00"></label>
+   <label class="speed">End <input id="taskend" type="time" value="12:03"></label>
+   <label class="speed">Days mask <input id="taskdays" type="number" min="0" max="127" value="127"><b>0–127</b></label>
+   <button class="conn" id="tasksave" style="margin-top:10px">Save enabled schedule</button>
+   <div class="hint" id="taskresult"></div>
+  </div>
+ </details>
+
+ <details class="acc">
   <summary>Arrow pad &amp; keyboard</summary>
   <div class="accbody"><div class="pad">
    <div class="btn empty"></div><div class="btn" data-dir="fwd">▲</div><div class="btn empty"></div>
@@ -172,6 +204,30 @@ function stopMove(){fetch('stop',{method:'POST'})}
 function act(n){fetch('action/'+n,{method:'POST'})}
 const ts={}; function tog(f){ts[f]=!ts[f];fetch('action/'+f+'_'+(ts[f]?'on':'off'),{method:'POST'});event.currentTarget.classList.toggle('on',ts[f])}
 const D={fwd:()=>move(speed,0),back:()=>move(-speed,0),left:()=>move(0,-speed),right:()=>move(0,speed),stop:stopMove};
+
+async function setParameter(path,value){
+ const response=await fetch('parameter/'+path,{method:'PUT',headers:P,body:JSON.stringify({value:Number(value)})});
+ if(!response.ok)throw new Error('setting rejected');return response.json();
+}
+document.querySelectorAll('.robot-param').forEach(el=>{
+ el.oninput=()=>el.nextElementSibling.textContent=el.value;
+ el.onchange=()=>setParameter(el.dataset.param,el.value).catch(()=>{});
+});
+document.querySelectorAll('.param-toggle').forEach(el=>el.onclick=()=>{
+ const value=el.classList.contains('on')?0:1;
+ setParameter(el.dataset.param,value).then(()=>el.classList.toggle('on',!!value)).catch(()=>{});
+});
+document.getElementById('tasksave').onclick=async()=>{
+ const result=document.getElementById('taskresult'), start=document.getElementById('taskstart').value.split(':').map(Number),
+       end=document.getElementById('taskend').value.split(':').map(Number);
+ result.textContent='Saving…';
+ const body={task_id:0,task_type:Number(document.getElementById('tasktype').value),enabled:true,
+  weekdays:Number(document.getElementById('taskdays').value),start_hour:start[0],start_minute:start[1],
+  end_hour:end[0],end_minute:end[1]};
+ try{const response=await fetch('security/tasks',{method:'PUT',headers:P,body:JSON.stringify(body)});
+  if(!response.ok)throw new Error();result.textContent='Schedule accepted by robot';}
+ catch(_){result.textContent='Robot did not accept the schedule';}
+};
 
 // ---- Analog joystick: direction = 360°, distance from center = speed (scaled by Max speed) ----
 const joy=document.getElementById('joy'), knob=document.getElementById('knob');
@@ -295,6 +351,11 @@ async function r(){try{const d=await(await fetch('info')).json();
  dot.style.background='currentColor';
  battEl.textContent=(d.charge>0?'⚡ ':'🔋 ')+(d.battery>=0?d.battery+'%':'—');
  statEl.textContent='RX '+d.frames_received+' · '+(d.codec||'—');
+ const params=d.parameters||{};
+ const aliases={eyes:'display-enable',night:'video-night_vision',avoid:'control-auto_avoidance',fall:'control-fallarrest',patrol:'security_patrol-enable'};
+ for(const [key,name] of Object.entries(aliases)){if(name in params){ts[key]=!!params[name];const el=document.querySelector(`[data-f="${key}"]`);if(el)el.classList.toggle('on',ts[key]);}}
+ document.querySelectorAll('.robot-param').forEach(el=>{const name=el.dataset.param.replace('/','-');if(name in params&&document.activeElement!==el){el.value=params[name];el.nextElementSibling.textContent=Math.round(params[name]);}});
+ document.querySelectorAll('.param-toggle').forEach(el=>{const name=el.dataset.param.replace('/','-');if(name in params)el.classList.toggle('on',!!params[name]);});
  connbtn.textContent=d.paused?'🔗 Reconnect panel':'🔌 Release for the Enabot app';
  connbtn.classList.toggle('on',d.paused);
  talkbtn.disabled=d.paused||!d.connected;

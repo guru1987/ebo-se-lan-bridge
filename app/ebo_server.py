@@ -18,8 +18,12 @@ from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSock
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import HTTPConnection
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
+
+from ebo_mavlink import (FrameBuilder, MAVLinkV1Stream, TimedTask,
+                         decode_telemetry, parse_parameter_value,
+                         parse_task_ack, parse_timed_task)
 
 EBO_DIR = os.environ.get("EBO_DIR", "/opt/ebo")
 PORT = int(os.environ.get("EBO_PORT", "8000"))
@@ -79,7 +83,8 @@ def _frame(msgid, payload, crc_extra):
     return bytes([0xfe]) + hdr + payload + struct.pack('<H', mavlink_crc(hdr + payload, crc_extra))
 
 def motor_frame(ly=0.0, rx=0.0, lx=0.0, ry=0.0, buttons=0):
-    # ly>0 = forward (robot convention is inverted -> negate)
+    # Public bridge convention: positive ly is forward. ROLA's native vertical
+    # joystick coordinate has the opposite sign, so msg 202 carries -ly.
     return _frame(202, struct.pack('<ffff', lx, -ly, rx, ry) + bytes([buttons & 0xFF]), 211)
 
 def param_set_frame(group, key, value, ptype=11):
@@ -90,6 +95,7 @@ def command_frame(command):
     return _frame(200, struct.pack('<H', command) + bytes([255, 1]), 196)
 
 CMD_DOCK = 40154
+MAVLINK = FrameBuilder()
 
 # Device info (captured; for a community release these would be queried at runtime via MAVLink)
 DEVICE_INFO = {
@@ -114,6 +120,28 @@ PARAM_TOGGLES = {
     "sleep": ("power", "sleep", 1.0), "wake": ("power", "sleep", 0.0),
 }
 
+# Parameters verified in the ROLA APK for EBO SE.  The type is MAVLink's
+# parameter type value; min/max are UI/API safeguards, not protocol limits.
+PARAMETERS = {
+    "display-enable": {"type": 11, "min": 0, "max": 1},
+    "video-night_vision": {"type": 11, "min": 0, "max": 1},
+    "control-auto_avoidance": {"type": 11, "min": 0, "max": 1},
+    "control-fallarrest": {"type": 11, "min": 0, "max": 1},
+    "control-speed": {"type": 6, "min": 0, "max": 100},
+    "audio-volume": {"type": 6, "min": 0, "max": 100},
+    "audio-call_volume": {"type": 6, "min": 0, "max": 100},
+    "security_patrol-enable": {"type": 11, "min": 0, "max": 1},
+    "security_fixed-enable": {"type": 11, "min": 0, "max": 1},
+    "security_fixed-notification": {"type": 11, "min": 0, "max": 1},
+    "security_fixed-notify_interval": {"type": 6, "min": -1, "max": 3600},
+    "security_fixed-range_point1_x": {"type": 6, "min": 0, "max": 100},
+    "security_fixed-range_point1_y": {"type": 6, "min": 0, "max": 100},
+    "security_fixed-range_point2_x": {"type": 6, "min": 0, "max": 100},
+    "security_fixed-range_point2_y": {"type": 6, "min": 0, "max": 100},
+    "security_fixed-sensitivity": {"type": 6, "min": 0, "max": 4},
+    "power-sleep": {"type": 11, "min": 0, "max": 1},
+}
+
 def lan_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
@@ -134,6 +162,15 @@ class Bridge:
         self.battery = -1
         self.charge = -1   # 0 = unplugged, 1 = charging/docked
         self.on_status = None   # callback(battery, charge) for MQTT
+        self.on_state = None    # callback(kind, name, value) for MQTT/other integrations
+        self.parameters = {}
+        self.parameter_meta = {}
+        self.telemetry = {}
+        self.timed_tasks = {1: {}, 2: {}}
+        self._task_list_counts = {1: None, 2: None}
+        self.last_task_ack = None
+        self._mav_stream = MAVLinkV1Stream()
+        self._state_condition = threading.Condition()
         self._ctrl_r, self._ctrl_w = os.pipe()
         self._a_r, self._a_w = os.pipe()    # robot audio -> ffmpeg second input
         os.set_inheritable(self._a_r, True)
@@ -144,6 +181,7 @@ class Bridge:
         self._speaker_ready = threading.Event()
         self._speaker_error = None
         self._speaker_state_lock = threading.Lock()
+        self._initial_refresh_started = False
         self._running = True
         self._ff_primed = False   # becomes True once ffmpeg has been fed an HEVC keyframe
         self.paused = False       # when True the native bridge is stopped, freeing the robot for the app
@@ -271,6 +309,7 @@ class Bridge:
             return
         self.paused = False
         self._ff_primed = False
+        self._initial_refresh_started = False
         print("[supervisor] resuming bridge", flush=True)
         self._start_bridge()
         threading.Thread(target=self._read_frames, daemon=True).start()
@@ -282,6 +321,9 @@ class Bridge:
             print("[bridge]", s, flush=True)
             if "connected" in s:
                 self.connected = True
+                if not self._initial_refresh_started:
+                    self._initial_refresh_started = True
+                    threading.Thread(target=self.refresh_parameters, daemon=True).start()
             if "speaker ready " in s:
                 with self._speaker_state_lock:
                     self._speaker_error = None
@@ -336,20 +378,124 @@ class Bridge:
                 self._restart_ffmpeg()
 
     def _parse_status(self, u):
-        i = 0
-        while i + 8 <= len(u):
-            if u[i] == 0xfe:
-                plen = u[i+1]; msgid = u[i+5] if i+5 < len(u) else -1
-                if msgid == 207 and i + 24 <= len(u):   # BATTERY_STATUS
-                    bp = u[i+22]; cs = u[i+23]
-                    if bp != self.battery or cs != self.charge:
-                        self.battery = bp; self.charge = cs
-                        if self.on_status:
-                            try: self.on_status(bp, cs)
-                            except Exception: pass
-                i += 8 + plen + 2 if plen else i + 1
-            else:
-                i += 1
+        for frame in self._mav_stream.feed(u):
+            changed = []
+            try:
+                if frame.message_id == 228:
+                    value = parse_parameter_value(frame.payload)
+                    with self._state_condition:
+                        self.parameters[value.name] = value.value
+                        self.parameter_meta[value.name] = {
+                            "type": value.parameter_type, "count": value.count,
+                            "index": value.index, "updated": time.time()}
+                        self._state_condition.notify_all()
+                    changed.append(("parameter", value.name, value.value))
+                elif frame.message_id == 154:
+                    task = parse_timed_task(frame.payload)
+                    with self._state_condition:
+                        self._task_list_counts[task.task_type] = task.count
+                        # Firmware represents an empty list with one zeroed ITEM
+                        # whose count is 0.  It is a sentinel, not task id 0.
+                        if task.count:
+                            self.timed_tasks[task.task_type][task.task_id] = task.as_dict()
+                        self._state_condition.notify_all()
+                    if task.count:
+                        changed.append(("task", str(task.task_id), task.as_dict()))
+                elif frame.message_id == 157:
+                    ack = parse_task_ack(frame.payload)
+                    with self._state_condition:
+                        self.last_task_ack = {**ack, "updated": time.time()}
+                        self._state_condition.notify_all()
+                    changed.append(("task_ack", str(ack["task_id"]), ack))
+                telemetry = decode_telemetry(frame)
+                if telemetry:
+                    with self._state_condition:
+                        self.telemetry.update(telemetry)
+                        self._state_condition.notify_all()
+                    for name, value in telemetry.items():
+                        changed.append(("telemetry", name, value))
+                    battery = telemetry.get("battery")
+                    if battery:
+                        bp, cs = battery["percent"], battery["charge_status"]
+                        if bp != self.battery or cs != self.charge:
+                            self.battery, self.charge = bp, cs
+                            if self.on_status:
+                                try: self.on_status(bp, cs)
+                                except Exception: pass
+            except (ValueError, struct.error) as exc:
+                print(f"[supervisor] ignored malformed MAVLink {frame.message_id}: {exc}", flush=True)
+            if self.on_state:
+                for kind, name, value in changed:
+                    try: self.on_state(kind, name, value)
+                    except Exception: pass
+
+    def read_parameter(self, group: str, key: str, timeout: float = 1.5):
+        name = f"{group}-{key}"
+        before = self.parameter_meta.get(name, {}).get("updated", 0)
+        self.send_rdt(MAVLINK.param_request(group, key))
+        end = time.monotonic() + timeout
+        with self._state_condition:
+            while self.parameter_meta.get(name, {}).get("updated", 0) <= before:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._state_condition.wait(remaining)
+        return self.parameters.get(name)
+
+    def set_parameter(self, group: str, key: str, value: float, timeout: float = 1.5):
+        name = f"{group}-{key}"
+        spec = PARAMETERS.get(name)
+        if spec is None:
+            raise ValueError("parameter is not in the EBO SE allowlist")
+        value = float(value)
+        if not spec["min"] <= value <= spec["max"]:
+            raise ValueError(f"value must be {spec['min']}..{spec['max']}")
+        if name == "security_fixed-sensitivity" and value not in (0, 2, 4):
+            raise ValueError("security sensitivity must be 0, 2, or 4")
+        if name == "security_fixed-notify_interval" and not (
+                value in (-1, 0) or (60 <= value <= 3600 and value % 60 == 0)):
+            raise ValueError("notification interval must be -1, 0, or whole minutes up to 3600 seconds")
+        before = self.parameter_meta.get(name, {}).get("updated", 0)
+        self.send_rdt(MAVLINK.param_set(group, key, value, spec["type"]))
+        end = time.monotonic() + timeout
+        with self._state_condition:
+            while self.parameter_meta.get(name, {}).get("updated", 0) <= before:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._state_condition.wait(remaining)
+        echoed = self.parameters.get(name)
+        return {"requested": value, "value": echoed, "acknowledged": echoed is not None and abs(echoed - value) < 0.001}
+
+    def request_timed_tasks(self, task_type: int, timeout: float = 1.5):
+        if task_type not in (1, 2):
+            raise ValueError("task type must be 1 (fixed point) or 2 (cruise)")
+        with self._state_condition:
+            self.timed_tasks[task_type] = {}
+            self._task_list_counts[task_type] = None
+        self.send_rdt(MAVLINK.timed_task_list(task_type))
+        end = time.monotonic() + timeout
+        with self._state_condition:
+            while time.monotonic() < end:
+                tasks = self.timed_tasks[task_type]
+                expected = self._task_list_counts[task_type]
+                if expected is not None and len(tasks) >= expected:
+                    break
+                self._state_condition.wait(max(0, end - time.monotonic()))
+            return list(self.timed_tasks[task_type].values())
+
+    def refresh_parameters(self, names=None, timeout: float = 0.5):
+        """Read supported settings without changing robot state."""
+        selected = names or PARAMETERS.keys()
+        values = {}
+        for name in selected:
+            if name not in PARAMETERS or "-" not in name:
+                continue
+            group, key = name.split("-", 1)
+            value = self.read_parameter(group, key, timeout)
+            if value is not None:
+                values[name] = value
+        return values
 
     def _send_command(self, kind: int, data: bytes = b""):
         if not 0 <= kind <= 255:
@@ -410,7 +556,8 @@ def do_action(name: str) -> bool:
         for _ in range(6): bridge.send_rdt(motor_frame(ly=0.5)); time.sleep(0.05)
         bridge.send_rdt(motor_frame())
     elif name in PARAM_TOGGLES:
-        g, k, v = PARAM_TOGGLES[name]; bridge.send_rdt(param_set_frame(g, k, v))
+        g, k, v = PARAM_TOGGLES[name]
+        bridge.set_parameter(g, k, v)
     else:
         return False
     return True
@@ -530,13 +677,107 @@ def info():
                    "count": bridge.audio_count} if bridge and bridge.audio_codec is not None else None),
         "battery": bridge.battery if bridge else -1,
         "charge": bridge.charge if bridge else -1,
+        "parameters": bridge.parameters if bridge else {},
+        "telemetry": bridge.telemetry if bridge else {},
         "rtsp": f"rtsp://{ip}:8554/{RTSP_PATH}",
     })
 
+
+class ParameterWrite(BaseModel):
+    value: float
+
+
+@app.get("/parameters")
+def parameters():
+    return {"values": dict(bridge.parameters), "metadata": dict(bridge.parameter_meta),
+            "supported": PARAMETERS}
+
+
+@app.get("/parameter/{group}/{key}")
+def parameter(group: str, key: str):
+    name = f"{group}-{key}"
+    if name not in PARAMETERS:
+        raise HTTPException(status_code=404, detail="unsupported EBO SE parameter")
+    value = bridge.read_parameter(group, key)
+    if value is None:
+        raise HTTPException(status_code=504, detail="robot did not return the parameter")
+    return {"name": name, "value": value, "metadata": bridge.parameter_meta.get(name, {})}
+
+
+@app.put("/parameter/{group}/{key}")
+def parameter_write(group: str, key: str, body: ParameterWrite):
+    try:
+        result = bridge.set_parameter(group, key, body.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not result["acknowledged"]:
+        raise HTTPException(status_code=504, detail={"message": "robot did not echo requested value", **result})
+    return {"ok": True, "name": f"{group}-{key}", **result}
+
+
+@app.get("/telemetry")
+def telemetry():
+    return dict(bridge.telemetry)
+
+
+class ScheduledSecurityTask(BaseModel):
+    task_id: int = 0
+    task_type: int
+    enabled: bool = True
+    weekdays: int = 0x7F
+    start_hour: int
+    start_minute: int
+    end_hour: int
+    end_minute: int
+    security_type: int = 0
+    security_disabled: int = 0
+    security_air_mode: int = 0
+
+
+@app.get("/security/tasks/{task_type}")
+def security_tasks(task_type: int):
+    try:
+        tasks = bridge.request_timed_tasks(task_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"task_type": task_type, "tasks": tasks}
+
+
+@app.put("/security/tasks")
+def security_task_write(body: ScheduledSecurityTask):
+    """Create/update an app-compatible fixed-point (1) or cruise (2) schedule.
+
+    Enabling a cruise entry authorizes later autonomous movement at its scheduled
+    time.  The endpoint never starts an immediate patrol.
+    """
+    values = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+    task = TimedTask(**values)
+    try:
+        task.validate()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    before = bridge.last_task_ack.get("updated", 0) if bridge.last_task_ack else 0
+    bridge.send_rdt(MAVLINK.timed_task_set(task))
+    end = time.monotonic() + 1.5
+    with bridge._state_condition:
+        while time.monotonic() < end:
+            current = bridge.last_task_ack
+            if (current and current.get("updated", 0) > before and
+                    current.get("task_id") == task.task_id and current.get("task_type") == task.task_type):
+                break
+            bridge._state_condition.wait(max(0, end - time.monotonic()))
+    ack = bridge.last_task_ack
+    accepted = bool(ack and ack.get("updated", 0) > before and
+                    ack.get("task_id") == task.task_id and ack.get("task_type") == task.task_type and
+                    ack.get("result") == 0)
+    if not accepted:
+        raise HTTPException(status_code=504, detail={"message": "robot did not accept scheduled task", "ack": ack})
+    return {"ok": True, "ack": ack, "warning": "enabled cruise tasks can move the robot at the scheduled time"}
+
 class Move(BaseModel):
-    ly: float = 0.0
-    rx: float = 0.0
-    duration: float = 0.4
+    ly: float = Field(default=0.0, ge=-1.0, le=1.0)
+    rx: float = Field(default=0.0, ge=-1.0, le=1.0)
+    duration: float = Field(default=0.4, gt=0.0, le=2.0)
 
 @app.post("/move")
 def move(m: Move):
