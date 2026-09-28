@@ -33,11 +33,13 @@
 11. **Expanded telemetry — implementation complete, live validation pending**
     IMU, wheel, temperature, camera/MCU, battery, and optional rangefinder fields are decoded.
 
-12. **SD-card media access — implemented, live validation pending**
-    `GET /media` and `GET /media/{name}` use the robot's MAVLink file server.
+12. **SD-card media access — implemented and live validated**
+    `GET /media` listed five card items and `GET /media/{name}` downloaded an
+    existing 486,484-byte JPEG with a valid JPEG signature.
 
-13. **Camera controls — substantially implemented, live validation pending**
-    Full-HD photo, raw day/night policy, forced colour/IR, and video start/stop are exposed.
+13. **Camera controls — substantially implemented, partly live validated**
+    Day/night state read back as automatic mode. Full-HD photo, forced colour/IR,
+    and video start/stop are exposed but still await hands-on live validation.
 
 14. **Security-event integration — partial**
     Settings and schedules exist; event history and complete notifications remain pending.
@@ -54,8 +56,9 @@
 18. **Single-session coordination — partial**
     Manual bridge/app handoff works; ownership display and automatic recovery need refinement.
 
-19. **Deployment and release — in progress**
-    Deploy and live-test this branch before preparing the upstream contribution.
+19. **Deployment and release — deployed, live validation in progress**
+    The feature branch is running on the bridge; media listing/download and
+    day/night state reads are validated before preparing the upstream contribution.
 
 20. **Battery auto-return switch — implemented, live validation pending**
     Actions use ROLA's type-3 do-not-disturb mechanism; there is no separate auto-return parameter.
