@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 
-from ebo_mavlink import (FrameBuilder, MAVLinkV1Stream, TimedTask,
+from ebo_mavlink import (CRC_EXTRA, FrameBuilder, MAVLinkV1Stream, TimedTask,
                          decode_telemetry, parse_parameter_value,
                          parse_file_server_info, parse_timed_task)
 
@@ -76,6 +76,11 @@ def test_do_not_disturb_task_and_file_server_frames():
     payload = struct.pack("<IB", 4567, 0) + b"192.168.10.9\0\0\0\0" + bytes(range(32))
     assert parse_file_server_info(payload) == {
         "port": 4567, "status": 0, "host": "192.168.10.9", "password": bytes(range(32))}
+
+
+def test_file_server_login_crc_extras_match_rola_protocol_table():
+    assert CRC_EXTRA[43] == 156
+    assert CRC_EXTRA[44] == 213
 
 
 def test_battery_and_motion_telemetry_decode():
