@@ -12,8 +12,14 @@ The API uses the same HTTP Basic authentication as the web panel.
 - `GET /parameter/{group}/{key}` asks the robot for one current value.
 - `PUT /parameter/{group}/{key}` writes `{"value": 50}` and waits for its echo.
 - `GET /telemetry` returns the latest decoded status messages.
-- `GET /security/tasks/1` reads fixed-point tasks; type `2` reads cruise tasks.
+- `GET /security/tasks/1` reads fixed-point tasks; type `2` reads cruise and type `3` reads do-not-disturb tasks.
 - `PUT /security/tasks` creates or updates an app-compatible schedule.
+- `POST /action/autoreturn_off` installs an all-day do-not-disturb task, suppressing automatic battery return; `autoreturn_on` disables it and restores the prior in-memory schedule when available.
+- `GET /auto-return` reports the derived auto-return state and the underlying type-3 tasks.
+- `GET /day-night` returns the configured camera policy; actions `night_auto`, `day`/`night_off`, and `night_on` select auto (`0`), forced colour (`1`), and forced IR/mono (`2`).
+- `POST /video/stop` and `/video/start` stop/start video IOCTRL only. The separate robot-audio and talkback channels remain connected.
+- `POST /photo` asks the robot IPC to save its original 1920x1080 frame under `/DICM`.
+- `GET /media` lists SD-card photos/videos; `GET /media/{name}` downloads an unambiguous basename.
 
 Supported settings include speaker volume, call volume, drive speed, eye
 lights, night vision, obstacle/fall protection, fixed-point and cruise patrol,
@@ -56,6 +62,28 @@ temperatures/overtemperature flags, camera state, and MCU mode.
 
 EBO SE hardware varies. Fields such as rangefinder simply remain absent when a
 robot does not report them; this bridge does not assume an SE2 laser exists.
+
+The APK exposes the configured day/night policy but no confirmed sensor message
+for the IR-cut mechanism's instantaneous state while automatic mode is active.
+Use forced day mode when colour output is required.
+
+## SD-card protocol
+
+Photo capture is TUTK IOCTRL `0x9901` with an eight-byte zero payload. Media
+access first sends MAVLink `FILE_SERVER_CMD_OPEN` (message 40) over RDT. The
+robot replies with a temporary LAN address, port, and 32-byte password in
+message 42; the bridge then logs in and uses MAVLink `FILE_TRANSFER_PROTOCOL`
+(message 218) on that TCP socket. No Android filesystem access is involved.
+
+Downloads are capped at 512 MiB by default; set `EBO_MEDIA_MAX_BYTES` to change
+that limit. Temporary downloads are deleted after the HTTP response completes.
+
+## Auto-return limitation
+
+ROLA does not expose a standalone `auto_return` parameter. Its documented
+suppression mechanism is do-not-disturb task type `3`. Therefore the switch is
+derived: "off" enables a seven-day 00:00–23:59 DND task, and "on" disables it.
+This may also suppress other firmware activity covered by do-not-disturb.
 
 ## Home Assistant MQTT
 

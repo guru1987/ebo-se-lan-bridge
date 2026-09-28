@@ -13,9 +13,10 @@ from typing import Any
 
 
 CRC_EXTRA = {
+    40: 70, 41: 41, 42: 136, 43: 213, 44: 58, 45: 58,
     48: 246, 152: 76, 153: 250, 154: 88, 155: 84, 156: 208, 157: 195,
     163: 48, 166: 133, 167: 16, 200: 196, 202: 211, 204: 19,
-    205: 42, 207: 222, 210: 100, 213: 117, 240: 9,
+    205: 42, 207: 222, 210: 100, 213: 117, 218: 84, 240: 9,
     226: 100, 227: 159, 228: 164, 229: 208,
 }
 
@@ -88,6 +89,12 @@ class FrameBuilder:
             raise ValueError("task request must be 0..255")
         return self.frame(156, struct.pack("<iBB", task_id, task_type, request))
 
+    def file_server_open(self) -> bytes:
+        return self.frame(40, bytes(36))
+
+    def file_server_close(self) -> bytes:
+        return self.frame(41, b"\0")
+
 
 def _parameter_name(group: str, key: str) -> bytes:
     name = f"{group}-{key}".encode("ascii")
@@ -97,8 +104,8 @@ def _parameter_name(group: str, key: str) -> bytes:
 
 
 def _task_type(value: int) -> None:
-    if value not in (1, 2):
-        raise ValueError("task type must be 1 (fixed point) or 2 (cruise)")
+    if value not in (1, 2, 3):
+        raise ValueError("task type must be 1 (fixed point), 2 (cruise), or 3 (do not disturb)")
 
 
 @dataclass(frozen=True)
@@ -208,6 +215,15 @@ def parse_task_ack(payload: bytes) -> dict[str, int]:
         raise ValueError("invalid TIMED_TASK_ACK payload")
     task_id, task_type, result = struct.unpack("<iBB", payload)
     return {"task_id": task_id, "task_type": task_type, "result": result}
+
+
+def parse_file_server_info(payload: bytes) -> dict[str, Any]:
+    if len(payload) != 53:
+        raise ValueError("invalid FILE_SERVER_INFO payload")
+    port, status = struct.unpack_from("<IB", payload)
+    host = payload[5:21].split(b"\0", 1)[0].decode("ascii")
+    password = bytes(payload[21:53])
+    return {"port": port, "status": status, "host": host, "password": password}
 
 
 def decode_telemetry(frame: MAVFrame) -> dict[str, Any] | None:

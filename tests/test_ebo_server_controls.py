@@ -16,9 +16,10 @@ def state_bridge():
     bridge.parameters = {}
     bridge.parameter_meta = {}
     bridge.telemetry = {}
-    bridge.timed_tasks = {1: {}, 2: {}}
-    bridge._task_list_counts = {1: None, 2: None}
+    bridge.timed_tasks = {1: {}, 2: {}, 3: {}}
+    bridge._task_list_counts = {1: None, 2: None, 3: None}
     bridge.last_task_ack = None
+    bridge.file_server_info = None
     bridge._mav_stream = MAVLinkV1Stream()
     bridge._state_condition = threading.Condition()
     bridge.on_status = None
@@ -93,6 +94,12 @@ class StatefulParameterTests(unittest.TestCase):
             bridge.set_parameter("security_fixed", "sensitivity", 3)
         with self.assertRaises(ValueError):
             bridge.set_parameter("security_fixed", "notify_interval", 61)
+
+    def test_day_night_uses_rola_numeric_modes(self):
+        self.assertEqual(ebo_server.PARAMETERS["video-night_vision"],
+                         {"type": 6, "min": 0, "max": 2})
+        self.assertEqual(ebo_server.PARAM_TOGGLES["day"], ("video", "night_vision", 1.0))
+        self.assertEqual(ebo_server.PARAM_TOGGLES["night_on"], ("video", "night_vision", 2.0))
 
 
 class ControlAPITests(unittest.TestCase):

@@ -12,10 +12,12 @@ Web panel:     EBO_WEB_USER EBO_WEB_PASS               (HTTP basic; disabled if 
 MQTT:          EBO_MQTT_HOST [EBO_MQTT_PORT EBO_MQTT_USER EBO_MQTT_PASS]
 Other:         EBO_DIR (/opt/ebo)  EBO_PORT (8000)  EBO_BIND (127.0.0.1)
 """
-import os, time, struct, threading, subprocess, secrets, socket, base64, urllib.request, urllib.error, http.cookiejar
+import os, time, struct, threading, subprocess, secrets, socket, base64, urllib.request, urllib.error, http.cookiejar, tempfile
+from dataclasses import replace
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import HTTPConnection
 from pydantic import BaseModel, Field
@@ -23,7 +25,8 @@ import uvicorn
 
 from ebo_mavlink import (FrameBuilder, MAVLinkV1Stream, TimedTask,
                          decode_telemetry, parse_parameter_value,
-                         parse_task_ack, parse_timed_task)
+                         parse_file_server_info, parse_task_ack, parse_timed_task)
+from ebo_media import EboMediaClient, MediaProtocolError
 
 EBO_DIR = os.environ.get("EBO_DIR", "/opt/ebo")
 PORT = int(os.environ.get("EBO_PORT", "8000"))
@@ -113,7 +116,9 @@ DEVICE_INFO = {
 
 PARAM_TOGGLES = {
     "eyes_on": ("display", "enable", 1.0), "eyes_off": ("display", "enable", 0.0),
-    "night_on": ("video", "night_vision", 1.0), "night_off": ("video", "night_vision", 0.0),
+    "night_auto": ("video", "night_vision", 0.0),
+    "day": ("video", "night_vision", 1.0), "night_off": ("video", "night_vision", 1.0),
+    "night_on": ("video", "night_vision", 2.0),
     "avoid_on": ("control", "auto_avoidance", 1.0), "avoid_off": ("control", "auto_avoidance", 0.0),
     "fall_on": ("control", "fallarrest", 1.0), "fall_off": ("control", "fallarrest", 0.0),
     "patrol_on": ("security_patrol", "enable", 1.0), "patrol_off": ("security_patrol", "enable", 0.0),
@@ -124,7 +129,7 @@ PARAM_TOGGLES = {
 # parameter type value; min/max are UI/API safeguards, not protocol limits.
 PARAMETERS = {
     "display-enable": {"type": 11, "min": 0, "max": 1},
-    "video-night_vision": {"type": 11, "min": 0, "max": 1},
+    "video-night_vision": {"type": 6, "min": 0, "max": 2},
     "control-auto_avoidance": {"type": 11, "min": 0, "max": 1},
     "control-fallarrest": {"type": 11, "min": 0, "max": 1},
     "control-speed": {"type": 6, "min": 0, "max": 100},
@@ -166,9 +171,13 @@ class Bridge:
         self.parameters = {}
         self.parameter_meta = {}
         self.telemetry = {}
-        self.timed_tasks = {1: {}, 2: {}}
-        self._task_list_counts = {1: None, 2: None}
+        self.timed_tasks = {1: {}, 2: {}, 3: {}}
+        self._task_list_counts = {1: None, 2: None, 3: None}
         self.last_task_ack = None
+        self.file_server_info = None
+        self.video_enabled = True
+        self._media_lock = threading.Lock()
+        self._autoreturn_saved_task = None
         self._mav_stream = MAVLinkV1Stream()
         self._state_condition = threading.Condition()
         self._ctrl_r, self._ctrl_w = os.pipe()
@@ -321,6 +330,9 @@ class Bridge:
             print("[bridge]", s, flush=True)
             if "connected" in s:
                 self.connected = True
+                if not self.video_enabled:
+                    try: self.send_ioctl(0x02ff, bytes(8))
+                    except Exception: pass
                 if not self._initial_refresh_started:
                     self._initial_refresh_started = True
                     threading.Thread(target=self.refresh_parameters, daemon=True).start()
@@ -407,6 +419,11 @@ class Bridge:
                         self.last_task_ack = {**ack, "updated": time.time()}
                         self._state_condition.notify_all()
                     changed.append(("task_ack", str(ack["task_id"]), ack))
+                elif frame.message_id == 42:
+                    info = parse_file_server_info(frame.payload)
+                    with self._state_condition:
+                        self.file_server_info = {**info, "updated": time.time()}
+                        self._state_condition.notify_all()
                 telemetry = decode_telemetry(frame)
                 if telemetry:
                     with self._state_condition:
@@ -468,8 +485,8 @@ class Bridge:
         return {"requested": value, "value": echoed, "acknowledged": echoed is not None and abs(echoed - value) < 0.001}
 
     def request_timed_tasks(self, task_type: int, timeout: float = 1.5):
-        if task_type not in (1, 2):
-            raise ValueError("task type must be 1 (fixed point) or 2 (cruise)")
+        if task_type not in (1, 2, 3):
+            raise ValueError("task type must be 1 (fixed point), 2 (cruise), or 3 (do not disturb)")
         with self._state_condition:
             self.timed_tasks[task_type] = {}
             self._task_list_counts[task_type] = None
@@ -483,6 +500,36 @@ class Bridge:
                     break
                 self._state_condition.wait(max(0, end - time.monotonic()))
             return list(self.timed_tasks[task_type].values())
+
+    def set_timed_task(self, task: TimedTask, timeout: float = 1.5):
+        task.validate()
+        before = self.last_task_ack.get("updated", 0) if self.last_task_ack else 0
+        self.send_rdt(MAVLINK.timed_task_set(task))
+        end = time.monotonic() + timeout
+        with self._state_condition:
+            while time.monotonic() < end:
+                ack = self.last_task_ack
+                if (ack and ack.get("updated", 0) > before and
+                        ack.get("task_id") == task.task_id and ack.get("task_type") == task.task_type):
+                    return ack
+                self._state_condition.wait(max(0, end - time.monotonic()))
+        return None
+
+    def set_auto_return(self, enabled: bool):
+        tasks = self.request_timed_tasks(3)
+        current = TimedTask(**tasks[0]) if tasks else TimedTask(task_type=3, weekdays=0x7f)
+        if not enabled:
+            self._autoreturn_saved_task = current
+            requested = replace(current, enabled=True, weekdays=0x7f,
+                                start_hour=0, start_minute=0, end_hour=23, end_minute=59)
+        else:
+            saved = self._autoreturn_saved_task
+            requested = replace(saved if saved else current, enabled=False)
+            self._autoreturn_saved_task = None
+        ack = self.set_timed_task(requested)
+        if not ack or ack.get("result") != 0:
+            raise TimeoutError("robot did not acknowledge do-not-disturb task")
+        return {"auto_return": enabled, "do_not_disturb": requested.as_dict(), "ack": ack}
 
     def refresh_parameters(self, names=None, timeout: float = 0.5):
         """Read supported settings without changing robot state."""
@@ -515,6 +562,34 @@ class Bridge:
 
     def send_ioctl(self, io_type: int, data: bytes = b""):
         self._send_command(1, struct.pack("<H", io_type) + data)
+
+    def set_video(self, enabled: bool):
+        self.send_ioctl(0x01ff if enabled else 0x02ff, bytes(8))
+        self.video_enabled = enabled
+        if enabled:
+            self._ff_primed = False
+
+    def open_media_client(self):
+        with self._state_condition:
+            before = (self.file_server_info or {}).get("updated", 0)
+        info = None
+        for _ in range(3):
+            self.send_rdt(MAVLINK.file_server_open())
+            end = time.monotonic() + 3.5
+            with self._state_condition:
+                while time.monotonic() < end:
+                    candidate = self.file_server_info
+                    if candidate and candidate.get("updated", 0) > before:
+                        before = candidate["updated"]
+                        if candidate["status"] == 0:
+                            info = candidate
+                            break
+                    self._state_condition.wait(max(0, end - time.monotonic()))
+            if info:
+                break
+        if not info:
+            raise TimeoutError("robot did not open its media file server")
+        return EboMediaClient(info["host"], info["port"], info["password"])
 
     def speaker_start(self, timeout: float = 12.0):
         if self.paused or not self.proc or self.proc.poll() is not None:
@@ -555,6 +630,10 @@ def do_action(name: str) -> bool:
     elif name == "undock":
         for _ in range(6): bridge.send_rdt(motor_frame(ly=0.5)); time.sleep(0.05)
         bridge.send_rdt(motor_frame())
+    elif name == "autoreturn_off":
+        bridge.set_auto_return(False)
+    elif name == "autoreturn_on":
+        bridge.set_auto_return(True)
     elif name in PARAM_TOGGLES:
         g, k, v = PARAM_TOGGLES[name]
         bridge.set_parameter(g, k, v)
@@ -673,6 +752,7 @@ def info():
         "awake": bridge.is_awake() if bridge else False,
         "codec": bridge.codec_name if bridge else None,
         "frames_received": bridge.frame_count if bridge else 0,
+        "video_enabled": bridge.video_enabled if bridge else False,
         "audio": ({"codec": f"0x{bridge.audio_codec:02x}", "flags": f"0x{bridge.audio_flags:02x}",
                    "count": bridge.audio_count} if bridge and bridge.audio_codec is not None else None),
         "battery": bridge.battery if bridge else -1,
@@ -720,6 +800,106 @@ def telemetry():
     return dict(bridge.telemetry)
 
 
+@app.get("/day-night")
+def day_night():
+    value = bridge.read_parameter("video", "night_vision")
+    if value is None:
+        raise HTTPException(status_code=504, detail="robot did not return day/night mode")
+    mode = {0: "auto", 1: "day", 2: "night"}.get(int(value), "unknown")
+    return {"value": value, "mode": mode, "colour_forced": int(value) == 1,
+            "note": "auto is configured policy; firmware does not report the current IR-cut sensor state"}
+
+
+@app.post("/video/{state}")
+def video(state: str):
+    if state not in ("start", "stop"):
+        raise HTTPException(status_code=400, detail="state must be start or stop")
+    bridge.set_video(state == "start")
+    return {"ok": True, "video_enabled": bridge.video_enabled,
+            "audio_preserved": True, "talkback_preserved": True}
+
+
+@app.post("/photo", status_code=202)
+def photo():
+    # ROLA takes its UI screenshot and then asks the IPC to save the original
+    # 1920x1080 frame to /DICM on the robot's SD card with this IOCTRL.
+    bridge.send_ioctl(0x9901, bytes(8))
+    return {"ok": True, "accepted": True, "storage": "/DICM"}
+
+
+def _media_list():
+    with bridge._media_lock:
+        client = None
+        try:
+            client = bridge.open_media_client()
+            return client.list_media()
+        finally:
+            if client:
+                client.close()
+            try: bridge.send_rdt(MAVLINK.file_server_close())
+            except Exception: pass
+
+
+@app.get("/media")
+def media():
+    try:
+        items = _media_list()
+    except (TimeoutError, OSError, MediaProtocolError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"count": len(items), "items": items}
+
+
+@app.get("/media/{name}")
+def media_file(name: str):
+    if not name or name != Path(name).name or "/" in name or "\\" in name:
+        raise HTTPException(status_code=400, detail="name must be a media basename")
+    tmp_path = None
+    with bridge._media_lock:
+        client = None
+        try:
+            client = bridge.open_media_client()
+            matches = [item for item in client.list_media() if item["name"] == name]
+            if not matches:
+                raise HTTPException(status_code=404, detail="media not found")
+            if len(matches) > 1:
+                raise HTTPException(status_code=409, detail="media basename is ambiguous")
+            item = matches[0]
+            maximum = int(os.environ.get("EBO_MEDIA_MAX_BYTES", str(512 * 1024 * 1024)))
+            if item["size"] > maximum:
+                raise HTTPException(status_code=413, detail="media exceeds EBO_MEDIA_MAX_BYTES")
+            fd, raw_path = tempfile.mkstemp(prefix="ebo-media-", suffix=Path(name).suffix)
+            os.close(fd)
+            tmp_path = Path(raw_path)
+            received = client.download(item["path"], tmp_path, item["size"])
+            if received != item["size"]:
+                raise MediaProtocolError(f"short media download ({received}/{item['size']})")
+        except HTTPException:
+            if tmp_path: tmp_path.unlink(missing_ok=True)
+            raise
+        except (TimeoutError, OSError, MediaProtocolError) as exc:
+            if tmp_path: tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        finally:
+            if client:
+                client.close()
+            try: bridge.send_rdt(MAVLINK.file_server_close())
+            except Exception: pass
+    media_type = "image/jpeg" if name.lower().endswith(".jpg") else "video/x-msvideo"
+    return FileResponse(tmp_path, filename=name, media_type=media_type,
+                        background=BackgroundTask(tmp_path.unlink, missing_ok=True))
+
+
+@app.get("/auto-return")
+def auto_return():
+    tasks = bridge.request_timed_tasks(3)
+    full_day_dnd = any(task["enabled"] and task["weekdays"] == 0x7f and
+                       task["start_hour"] == 0 and task["start_minute"] == 0 and
+                       task["end_hour"] == 23 and task["end_minute"] == 59
+                       for task in tasks)
+    return {"auto_return": not full_day_dnd, "do_not_disturb_tasks": tasks,
+            "derived": True}
+
+
 class ScheduledSecurityTask(BaseModel):
     task_id: int = 0
     task_type: int
@@ -745,7 +925,7 @@ def security_tasks(task_type: int):
 
 @app.put("/security/tasks")
 def security_task_write(body: ScheduledSecurityTask):
-    """Create/update an app-compatible fixed-point (1) or cruise (2) schedule.
+    """Create/update a fixed-point (1), cruise (2), or do-not-disturb (3) schedule.
 
     Enabling a cruise entry authorizes later autonomous movement at its scheduled
     time.  The endpoint never starts an immediate patrol.
@@ -756,20 +936,8 @@ def security_task_write(body: ScheduledSecurityTask):
         task.validate()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    before = bridge.last_task_ack.get("updated", 0) if bridge.last_task_ack else 0
-    bridge.send_rdt(MAVLINK.timed_task_set(task))
-    end = time.monotonic() + 1.5
-    with bridge._state_condition:
-        while time.monotonic() < end:
-            current = bridge.last_task_ack
-            if (current and current.get("updated", 0) > before and
-                    current.get("task_id") == task.task_id and current.get("task_type") == task.task_type):
-                break
-            bridge._state_condition.wait(max(0, end - time.monotonic()))
-    ack = bridge.last_task_ack
-    accepted = bool(ack and ack.get("updated", 0) > before and
-                    ack.get("task_id") == task.task_id and ack.get("task_type") == task.task_type and
-                    ack.get("result") == 0)
+    ack = bridge.set_timed_task(task)
+    accepted = bool(ack and ack.get("result") == 0)
     if not accepted:
         raise HTTPException(status_code=504, detail={"message": "robot did not accept scheduled task", "ack": ack})
     return {"ok": True, "ack": ack, "warning": "enabled cruise tasks can move the robot at the scheduled time"}

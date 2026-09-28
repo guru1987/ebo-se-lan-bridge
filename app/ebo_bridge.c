@@ -456,6 +456,7 @@ int main(void){
     char rbuf[4096];   /* inbound MAVLink (battery / status) via RDT_Read */
     time_t last_ka=time(NULL);
     int audlog=0;      /* log the first few audio frames' codec/rate */
+    int video_enabled=1;
     int alive=1;
     while(alive && !shutting_down){
       int n=recv2(av, buf, 1024*1024, &fa,&fb, fi, 64, &fc,&fd2);
@@ -479,7 +480,10 @@ int main(void){
       }
 
       time_t now=time(NULL);
-      if(now-last_ka>=10){ sendio(av,0x1ff,(const char*)z8,8); last_ka=now; }   /* stream keepalive */
+      if(now-last_ka>=10){
+        if(video_enabled) sendio(av,0x1ff,(const char*)z8,8);  /* video stream keepalive */
+        last_ka=now;
+      }
 
       /* inbound status (battery, etc.) -> stdout status frame, codec 0xFF */
       if(rdt_read && rdtch>=0){
@@ -499,7 +503,11 @@ int main(void){
           if(cpos<4+(int)clen) break;
           if(clen>=1){ unsigned char kind=cbuf[4]; int wr=0;
             if(kind==CMD_RDT && rdt_write && rdtch>=0){ wr=rdt_write(rdtch, (const char*)(cbuf+5), clen-1); }
-            else if(kind==CMD_IOCTRL && clen>=3){ unsigned io=get_le16(cbuf+5); wr=sendio(av, io, (const char*)(cbuf+7), clen-3); }
+            else if(kind==CMD_IOCTRL && clen>=3){ unsigned io=get_le16(cbuf+5);
+              wr=sendio(av, io, (const char*)(cbuf+7), clen-3);
+              if(io==0x1ff) video_enabled=1;
+              else if(io==0x2ff) video_enabled=0;
+            }
             else if(kind==CMD_SPEAKER_START){ wr=speaker_start_session(sid,av); }
             else if(kind==CMD_SPEAKER_PCM16LE){ wr=speaker_send_pcm16le(cbuf+5,clen-1); }
             else if(kind==CMD_SPEAKER_STOP){ wr=speaker_stop_session(sid,av,1); }

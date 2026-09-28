@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 
 from ebo_mavlink import (FrameBuilder, MAVLinkV1Stream, TimedTask,
                          decode_telemetry, parse_parameter_value,
-                         parse_timed_task)
+                         parse_file_server_info, parse_timed_task)
 
 
 def test_stream_handles_fragmentation_noise_and_multiple_frames():
@@ -63,6 +63,19 @@ def test_timed_task_set_and_item_round_trip():
     assert parsed.task_type == 2
     assert parsed.count == 1 and parsed.index == 0
     assert parsed.start_minute == 4 and parsed.end_minute == 7
+
+
+def test_do_not_disturb_task_and_file_server_frames():
+    builder = FrameBuilder()
+    dnd = TimedTask(task_type=3, weekdays=0x7f, start_hour=0, start_minute=0,
+                    end_hour=23, end_minute=59)
+    assert MAVLinkV1Stream().feed(builder.timed_task_set(dnd))[0].payload[28] == 3
+    assert MAVLinkV1Stream().feed(builder.file_server_open())[0].message_id == 40
+    assert MAVLinkV1Stream().feed(builder.file_server_close())[0].message_id == 41
+
+    payload = struct.pack("<IB", 4567, 0) + b"192.168.10.9\0\0\0\0" + bytes(range(32))
+    assert parse_file_server_info(payload) == {
+        "port": 4567, "status": 0, "host": "192.168.10.9", "password": bytes(range(32))}
 
 
 def test_battery_and_motion_telemetry_decode():
