@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import time
 from pathlib import Path
 
 from ebo_mavlink import FrameBuilder, MAVLinkV1Stream
@@ -29,7 +30,19 @@ class EboMediaClient:
     def __init__(self, host: str, port: int, password: bytes, timeout: float = 8.0):
         if not host or not 0 < port < 65536 or len(password) != 32:
             raise ValueError("invalid EBO file-server details")
-        self.sock = socket.create_connection((host, port), timeout=timeout)
+        # FILE_SERVER_INFO can arrive a few hundred milliseconds before the IPC
+        # listener is accepting. ROLA retries this connection as well.
+        deadline = time.monotonic() + min(timeout, 4.0)
+        last_error = None
+        while True:
+            try:
+                self.sock = socket.create_connection((host, port), timeout=timeout)
+                break
+            except ConnectionRefusedError as exc:
+                last_error = exc
+                if time.monotonic() >= deadline:
+                    raise last_error
+                time.sleep(0.1)
         self.sock.settimeout(timeout)
         self.frames = MAVLinkV1Stream()
         self.builder = FrameBuilder()
