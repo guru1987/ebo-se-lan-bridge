@@ -1,7 +1,8 @@
 # Remaining feature backlog
 
-1. **Control-only / low-heat mode — implemented, live validation pending**
-   `POST /video/stop|start` toggles only video; audio and talkback stay online.
+1. **Control-only / low-heat mode — implemented, audio-only RTSP validation pending**
+   `POST /video/stop|start` toggles only video. Hearing can use the independent `/ebo_audio`
+   RTSP path; talkback stays online, and video start now waits for a publishable frame.
 
 2. **On-demand snapshots — protocol implemented, live validation pending**
    `POST /photo` creates a full-HD SD photo. A transient live-frame JPEG endpoint remains optional.

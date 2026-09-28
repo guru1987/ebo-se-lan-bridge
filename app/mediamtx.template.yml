@@ -13,6 +13,8 @@ authInternalUsers:
     permissions:
       - action: publish
         path: ebo
+      - action: publish
+        path: ebo_audio
   - user: __STREAM_USER__
     pass: __STREAM_PASS__
     permissions:
@@ -21,4 +23,6 @@ authInternalUsers:
 
 paths:
   ebo:
+    source: publisher
+  ebo_audio:
     source: publisher

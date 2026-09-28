@@ -34,9 +34,9 @@ PORT = int(os.environ.get("EBO_PORT", "8000"))
 # tunnel (or a reverse proxy), not exposed directly on the LAN. Set EBO_BIND=0.0.0.0
 # to expose it on the LAN instead.
 BIND_HOST = os.environ.get("EBO_BIND", "127.0.0.1")
-# Robot audio (listen-only). DISABLED by default: muxing the robot's G.711 added latency to both
-# audio and video, so the stream is kept video-only for the smooth, low-latency experience.
-# Set EBO_AUDIO=1 to re-enable (G.711 8 kHz mono, codec 0x8a; EBO_AUDIO_FMT=alaw if distorted).
+# Robot audio (listen-only). EBO_AUDIO controls whether it is also muxed into the legacy
+# combined /ebo path. The independent /ebo_audio path is always published, so hearing remains
+# available when video is stopped (G.711 8 kHz mono; use EBO_AUDIO_FMT=alaw if distorted).
 AUDIO_ON = os.environ.get("EBO_AUDIO", "0") == "1"
 AUDIO_FMT = os.environ.get("EBO_AUDIO_FMT", "mulaw")   # mulaw | alaw
 AUDIO_RATE = os.environ.get("EBO_AUDIO_RATE", "8000")
@@ -46,6 +46,8 @@ AUDIO_RATE = os.environ.get("EBO_AUDIO_RATE", "8000")
 #   EBO_AUDIO_FILTER=highpass=f=200,afftdn=nr=20,dynaudnorm=g=11:m=15,alimiter=limit=0.9
 AUDIO_FILTER = os.environ.get("EBO_AUDIO_FILTER", "none")
 RTSP_PATH = "ebo"
+RTSP_AUDIO_PATH = "ebo_audio"
+VIDEO_READY_TIMEOUT = float(os.environ.get("EBO_VIDEO_READY_TIMEOUT", "12"))
 STREAM_USER = os.environ.get("EBO_STREAM_USER", "ebo")
 STREAM_PASS = os.environ.get("EBO_STREAM_PASS", "")
 WEB_USER = os.environ.get("EBO_WEB_USER")
@@ -162,6 +164,7 @@ class Bridge:
         self.audio_codec = None # codec_id of inbound audio frames (discovered at runtime)
         self.audio_flags = None # TUTK audio flags (sample rate / bits / channel)
         self.audio_count = 0
+        self.last_audio = 0.0
         self.connected = False
         self.codec_name = None
         self.battery = -1
@@ -176,6 +179,9 @@ class Bridge:
         self.last_task_ack = None
         self.file_server_info = None
         self.video_enabled = True
+        self._published_frame_count = 0
+        self._last_published_frame = 0.0
+        self._video_start_publish_count = -1
         self._media_lock = threading.Lock()
         self._autoreturn_saved_task = None
         self._mav_stream = MAVLinkV1Stream()
@@ -184,6 +190,9 @@ class Bridge:
         self._a_r, self._a_w = os.pipe()    # robot audio -> ffmpeg second input
         os.set_inheritable(self._a_r, True)
         os.set_blocking(self._a_w, False)   # never block: drop audio if ffmpeg lags
+        self._ao_r, self._ao_w = os.pipe()  # robot audio -> independent audio-only ffmpeg
+        os.set_inheritable(self._ao_r, True)
+        os.set_blocking(self._ao_w, False)
         self._a_buf = bytearray()           # jitter buffer for robot audio
         self._a_lock = threading.Lock()
         self._ctrl_lock = threading.Lock()  # keep fd3 frames atomic across HTTP/WebSocket threads
@@ -197,19 +206,20 @@ class Bridge:
         self._start_mediamtx()
         time.sleep(0.6)
         self._start_ffmpeg()
+        self._start_audio_ffmpeg()
         self._start_bridge()
         threading.Thread(target=self._read_frames, daemon=True).start()
         threading.Thread(target=self._log_stderr, args=(self.proc,), daemon=True).start()
-        if AUDIO_ON:
-            threading.Thread(target=self._audio_feeder, daemon=True).start()
+        threading.Thread(target=self._audio_feeder, daemon=True).start()
 
     def _audio_feeder(self):
-        # Emit a smooth real-time G.711 stream to ffmpeg: robot audio when available, silence
-        # otherwise. A continuous audio input keeps ffmpeg from blocking on an empty pipe (which
-        # would stall the muxer and, with it, the video). Silence byte: 0xFF µ-law / 0xD5 A-law.
+        # Emit smooth real-time G.711 to the independent audio publisher and, when enabled, the
+        # legacy combined publisher. Silence keeps each RTSP path continuously readable.
+        # Silence byte: 0xFF µ-law / 0xD5 A-law.
         rate = int(AUDIO_RATE); chunk = max(80, rate // 50); interval = chunk / rate   # ~20 ms
         silence = (b"\xff" if AUDIO_FMT == "mulaw" else b"\xd5") * chunk
         next_t = time.monotonic()
+        last_audio_restart = 0.0
         while self._running:
             next_t += interval
             with self._a_lock:
@@ -219,8 +229,13 @@ class Bridge:
                     out = bytes(self._a_buf) + silence[len(self._a_buf):]; self._a_buf.clear()
                 else:
                     out = silence
-            try: os.write(self._a_w, out)
-            except Exception: pass
+            if self.audio_ff.poll() is not None and time.monotonic() - last_audio_restart >= 2.0:
+                last_audio_restart = time.monotonic()
+                self._restart_audio_ffmpeg()
+            targets = (self._ao_w, self._a_w) if AUDIO_ON else (self._ao_w,)
+            for target in targets:
+                try: os.write(target, out)
+                except (BlockingIOError, BrokenPipeError, OSError): pass
             d = next_t - time.monotonic()
             if d > 0: time.sleep(d)
             else: next_t = time.monotonic()
@@ -264,6 +279,26 @@ class Bridge:
         self.ff = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, pass_fds=pass_fds)
         print("[supervisor] ffmpeg pid", self.ff.pid, flush=True)
+
+    def _start_audio_ffmpeg(self):
+        """Publish robot microphone audio independently of the video muxer."""
+        url = f"rtsp://127.0.0.1:8554/{RTSP_AUDIO_PATH}"
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+               "-fflags", "nobuffer", "-flags", "low_delay",
+               "-use_wallclock_as_timestamps", "1", "-thread_queue_size", "256",
+               "-f", AUDIO_FMT, "-ar", AUDIO_RATE, "-ac", "1", "-i", f"pipe:{self._ao_r}",
+               "-map", "0:a", "-c:a", "copy", "-vn",
+               "-f", "rtsp", "-rtsp_transport", "tcp", url]
+        self.audio_ff = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         pass_fds=(self._ao_r,))
+        print("[supervisor] audio ffmpeg pid", self.audio_ff.pid, flush=True)
+
+    def _restart_audio_ffmpeg(self):
+        try: self.audio_ff.kill()
+        except Exception: pass
+        self._start_audio_ffmpeg()
+        print("[supervisor] audio ffmpeg restarted", flush=True)
 
     def _restart_ffmpeg(self):
         # ffmpeg died (e.g. broken pipe). Restart it and re-sync at the next keyframe.
@@ -368,14 +403,16 @@ class Bridge:
                 if len(data) >= 2:
                     self.audio_codec, self.audio_flags = data[0], data[1]
                     self.audio_count += 1
-                    if AUDIO_ON and len(data) > 2:
+                    self.last_audio = time.time()
+                    if len(data) > 2:
                         with self._a_lock:
                             self._a_buf += data[2:]
                             if len(self._a_buf) > 1600:      # cap latency (~200ms): drop oldest
                                 del self._a_buf[:len(self._a_buf) - 1600]
                 continue
-            self.frame_count += 1
-            self.last_frame = time.time()
+            with self._state_condition:
+                self.frame_count += 1
+                self.last_frame = time.time()
             self.codec_name = "hevc" if codec == 80 else ("h264" if codec == 78 else f"codec{codec}")
             # ffmpeg must start at a keyframe: skip frames until one carries the
             # parameter sets (HEVC VPS/SPS, H.264 SPS), otherwise it can't determine
@@ -386,6 +423,10 @@ class Bridge:
                 self._ff_primed = True
             try:
                 self.ff.stdin.write(data); self.ff.stdin.flush()
+                with self._state_condition:
+                    self._published_frame_count += 1
+                    self._last_published_frame = time.time()
+                    self._state_condition.notify_all()
             except Exception:
                 self._restart_ffmpeg()
 
@@ -563,11 +604,36 @@ class Bridge:
     def send_ioctl(self, io_type: int, data: bytes = b""):
         self._send_command(1, struct.pack("<H", io_type) + data)
 
-    def set_video(self, enabled: bool):
-        self.send_ioctl(0x01ff if enabled else 0x02ff, bytes(8))
-        self.video_enabled = enabled
-        if enabled:
-            self._ff_primed = False
+    def video_ready(self):
+        with self._state_condition:
+            return (self.video_enabled and
+                    self._published_frame_count > self._video_start_publish_count and
+                    time.time() - self._last_published_frame < 2.0)
+
+    def set_video(self, enabled: bool, timeout: float = VIDEO_READY_TIMEOUT):
+        with self._state_condition:
+            before = self._published_frame_count
+            previous = (self.video_enabled, self._video_start_publish_count, self._ff_primed)
+            self.video_enabled = enabled
+            self._video_start_publish_count = before
+            if enabled:
+                self._ff_primed = False
+        try:
+            self.send_ioctl(0x01ff if enabled else 0x02ff, bytes(8))
+        except Exception:
+            with self._state_condition:
+                self.video_enabled, self._video_start_publish_count, self._ff_primed = previous
+            raise
+        if not enabled:
+            return False
+        with self._state_condition:
+            deadline = time.monotonic() + timeout
+            while not self.video_ready():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._state_condition.wait(remaining)
+            return True
 
     def open_media_client(self):
         with self._state_condition:
@@ -746,6 +812,7 @@ async def hls(path: str, request: Request):
 @app.get("/info")
 def info():
     ip = lan_ip()
+    now = time.time()
     return JSONResponse({
         "connected": bridge.connected if bridge else False,
         "paused": bridge.paused if bridge else False,
@@ -753,13 +820,17 @@ def info():
         "codec": bridge.codec_name if bridge else None,
         "frames_received": bridge.frame_count if bridge else 0,
         "video_enabled": bridge.video_enabled if bridge else False,
+        "video_ready": bridge.video_ready() if bridge else False,
         "audio": ({"codec": f"0x{bridge.audio_codec:02x}", "flags": f"0x{bridge.audio_flags:02x}",
-                   "count": bridge.audio_count} if bridge and bridge.audio_codec is not None else None),
+                   "count": bridge.audio_count, "active": now - bridge.last_audio < 2.0,
+                   "last_received": bridge.last_audio}
+                  if bridge and bridge.audio_codec is not None else None),
         "battery": bridge.battery if bridge else -1,
         "charge": bridge.charge if bridge else -1,
         "parameters": bridge.parameters if bridge else {},
         "telemetry": bridge.telemetry if bridge else {},
         "rtsp": f"rtsp://{ip}:8554/{RTSP_PATH}",
+        "rtsp_audio": f"rtsp://{ip}:8554/{RTSP_AUDIO_PATH}",
     })
 
 
@@ -814,9 +885,19 @@ def day_night():
 def video(state: str):
     if state not in ("start", "stop"):
         raise HTTPException(status_code=400, detail="state must be start or stop")
-    bridge.set_video(state == "start")
+    ready = bridge.set_video(state == "start")
+    if state == "start" and not ready:
+        raise HTTPException(status_code=504, detail="video enabled but no publishable frame arrived before timeout")
     return {"ok": True, "video_enabled": bridge.video_enabled,
-            "audio_preserved": True, "talkback_preserved": True}
+            "video_ready": bridge.video_ready(), "audio_preserved": True,
+            "talkback_preserved": True}
+
+
+@app.get("/video/ready")
+def video_ready():
+    return {"video_enabled": bridge.video_enabled, "video_ready": bridge.video_ready(),
+            "frames_received": bridge.frame_count,
+            "frames_published": bridge._published_frame_count}
 
 
 @app.post("/photo", status_code=202)

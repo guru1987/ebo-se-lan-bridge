@@ -17,7 +17,8 @@ The API uses the same HTTP Basic authentication as the web panel.
 - `POST /action/autoreturn_off` installs an all-day do-not-disturb task, suppressing automatic battery return; `autoreturn_on` disables it and restores the prior in-memory schedule when available.
 - `GET /auto-return` reports the derived auto-return state and the underlying type-3 tasks.
 - `GET /day-night` returns the configured camera policy; actions `night_auto`, `day`/`night_off`, and `night_on` select auto (`0`), forced colour (`1`), and forced IR/mono (`2`).
-- `POST /video/stop` and `/video/start` stop/start video IOCTRL only. The separate robot-audio and talkback channels remain connected.
+- `POST /video/stop` and `/video/start` stop/start video IOCTRL only. The separate robot-audio and talkback channels remain connected. `/video/start` waits for a new publishable frame (or returns 504 after `EBO_VIDEO_READY_TIMEOUT`, default 12 seconds); `GET /video/ready` provides non-mutating readiness state.
+- The existing `rtsp://BRIDGE:8554/ebo` path remains unchanged. Always-on microphone audio is also published independently at `rtsp://BRIDGE:8554/ebo_audio`, so audio readers do not stall when video is stopped.
 - `POST /photo` asks the robot IPC to save its original 1920x1080 frame under `/DICM`.
 - `GET /media` lists SD-card photos/videos; `GET /media/{name}` downloads an unambiguous basename.
 

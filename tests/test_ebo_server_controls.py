@@ -1,6 +1,7 @@
 import struct
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -139,6 +140,69 @@ class ControlAPITests(unittest.TestCase):
             response = client.put("/parameter/audio/volume", json={"value": 44})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["acknowledged"])
+
+
+class VideoAndAudioPublicationTests(unittest.TestCase):
+    def video_bridge(self):
+        bridge = ebo_server.Bridge.__new__(ebo_server.Bridge)
+        bridge.frame_count = 20
+        bridge.video_enabled = False
+        bridge._published_frame_count = 10
+        bridge._last_published_frame = 0.0
+        bridge._video_start_publish_count = 10
+        bridge._ff_primed = True
+        bridge._state_condition = threading.Condition()
+        return bridge
+
+    def test_video_start_waits_for_a_new_published_frame(self):
+        bridge = self.video_bridge()
+        sent = threading.Event()
+
+        def send_ioctl(io_type, data):
+            self.assertEqual((io_type, data), (0x01ff, bytes(8)))
+            sent.set()
+
+        bridge.send_ioctl = send_ioctl
+
+        def publish():
+            self.assertTrue(sent.wait(0.5))
+            with bridge._state_condition:
+                bridge._ff_primed = True
+                bridge._published_frame_count += 1
+                bridge._last_published_frame = time.time()
+                bridge._state_condition.notify_all()
+
+        worker = threading.Thread(target=publish)
+        worker.start()
+        self.assertTrue(bridge.set_video(True, timeout=0.5))
+        worker.join()
+        self.assertTrue(bridge.video_ready())
+        self.assertTrue(bridge._ff_primed)
+
+    def test_video_start_times_out_without_a_publishable_frame(self):
+        bridge = self.video_bridge()
+        bridge.send_ioctl = lambda *_: None
+        self.assertFalse(bridge.set_video(True, timeout=0.01))
+        self.assertFalse(bridge.video_ready())
+
+    def test_video_stop_is_immediate_and_not_ready(self):
+        bridge = self.video_bridge()
+        calls = []
+        bridge.send_ioctl = lambda *args: calls.append(args)
+        self.assertFalse(bridge.set_video(False))
+        self.assertEqual(calls, [(0x02ff, bytes(8))])
+        self.assertFalse(bridge.video_ready())
+
+    def test_audio_only_ffmpeg_publishes_separate_rtsp_path(self):
+        bridge = ebo_server.Bridge.__new__(ebo_server.Bridge)
+        bridge._ao_r = 17
+        process = mock.Mock(pid=123)
+        with mock.patch.object(ebo_server.subprocess, "Popen", return_value=process) as popen:
+            bridge._start_audio_ffmpeg()
+        command = popen.call_args.args[0]
+        self.assertIn("rtsp://127.0.0.1:8554/ebo_audio", command)
+        self.assertIn("-vn", command)
+        self.assertEqual(popen.call_args.kwargs["pass_fds"], (17,))
 
 
 if __name__ == "__main__":

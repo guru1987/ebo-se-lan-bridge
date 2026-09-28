@@ -24,6 +24,7 @@ original deployment is ARM32; ARM64 is supported for hardware such as the ODROID
                                  │ H.265/G.711             ▲ control + speaker PCM (fd3)
                                  ▼                         │
                             ffmpeg -c copy ──► mediamtx (RTSP/WebRTC/HLS)
+                              └ audio-only ──► /ebo_audio (always on)
                                  │                        │
    Home Assistant ◄── RTSP camera ──┘     MQTT entities ──┴── ebo_server.py (supervisor)
    (on your mini-PC)  ◄── MQTT discovery ──────────────────────────┘
@@ -33,6 +34,8 @@ original deployment is ARM32; ARM64 is supported for hardware such as the ODROID
   the RTSP stream. It never authenticates with the robot.
 - **Video is passthrough** (`ffmpeg -c:v copy`): the bridge host does *no* decoding/transcoding
   (~5% CPU). The viewer (browser / HA) decodes HEVC in hardware.
+- **Robot microphone audio has an independent RTSP path** at `/ebo_audio`; it remains readable
+  while video on the existing `/ebo` path is intentionally paused.
 - **Battery/status** comes from the robot over the reliable channel (`RDT_Read`).
 
 ## Components
