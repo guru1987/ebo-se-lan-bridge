@@ -893,6 +893,20 @@ def video(state: str):
             "talkback_preserved": True}
 
 
+@app.post("/debug/ioctl")
+def debug_ioctl(body: dict, request: Request):
+    """Send one raw IOCTRL to the robot (local callers only). For probing
+    undocumented commands, e.g. {"type": "0x320", "payload": "0000000002000000"}."""
+    if request.client.host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="local only")
+    io = int(str(body.get("type")), 0)
+    data = bytes.fromhex(str(body.get("payload", "")))
+    if not 0 < io < 0x10000 or len(data) > 256:
+        raise HTTPException(status_code=400, detail="bad type or payload")
+    bridge.send_ioctl(io, data)
+    return {"ok": True, "type": hex(io), "bytes": len(data)}
+
+
 @app.get("/video/ready")
 def video_ready():
     return {"video_enabled": bridge.video_enabled, "video_ready": bridge.video_ready(),
