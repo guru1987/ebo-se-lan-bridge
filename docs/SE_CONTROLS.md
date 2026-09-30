@@ -18,6 +18,7 @@ The API uses the same HTTP Basic authentication as the web panel.
 - `GET /auto-return` reports the derived auto-return state and the underlying type-3 tasks.
 - `GET /day-night` returns the configured camera policy; actions `night_auto`, `day`/`night_off`, and `night_on` select auto (`0`), forced colour (`1`), and forced IR/mono (`2`).
 - `POST /video/stop` and `/video/start` stop/start video IOCTRL only. The separate robot-audio and talkback channels remain connected. `/video/start` waits for a new publishable frame (or returns 504 after `EBO_VIDEO_READY_TIMEOUT`, default 12 seconds); `GET /video/ready` provides non-mutating readiness state.
+- `PUT /video/quality` with `{"level":"auto|high|medium|low"}` selects ROLA's persisted live-view profile. `GET /video/quality` reports the last bridge request and known targets; the firmware does not echo its persisted selection.
 - The existing `rtsp://BRIDGE:8554/ebo` path remains unchanged. Always-on microphone audio is also published independently at `rtsp://BRIDGE:8554/ebo_audio`, so audio readers do not stall when video is stopped.
 - `POST /photo` asks the robot IPC to save its original 1920x1080 frame under `/DICM`.
 - `GET /media` lists SD-card photos/videos; `GET /media/{name}` downloads an unambiguous basename.
@@ -67,6 +68,24 @@ robot does not report them; this bridge does not assume an SE2 laser exists.
 The APK exposes the configured day/night policy but no confirmed sensor message
 for the IR-cut mechanism's instantaneous state while automatic mode is active.
 Use forced day mode when colour output is required.
+
+## Live-view quality
+
+ROLA sends vendor IOCTRL `0x990a` on the tested EBO SE. Its 12-byte payload is
+three little-endian unsigned integers: `(level, bitrate_kbps, 1)`. The older
+`0x9906` variant can be selected with `EBO_VIDEO_QUALITY_IOCTL=0x9906`.
+
+| Level | Wire values | Live resolution | Target kb/s | Observed kb/s |
+| --- | --- | ---: | ---: | ---: |
+| Auto | `(0, 0, 1)` | 848x480 in this run | adaptive | 262 |
+| High | `(1, 4096, 1)` | 1920x1080 | 4096 | 2068 |
+| Medium | `(2, 1500, 1)` | 848x480 | 1500 | 784 |
+| Low | `(3, 768, 1)` | 848x480 | 768 | 364 |
+
+Observed rates are 15-second video-only HEVC payload averages while the robot
+faced a mostly static scene. They are below the configured ceilings because the
+encoder is variable-rate. Auto is adaptive and may choose differently with
+other network or scene conditions.
 
 ## SD-card protocol
 

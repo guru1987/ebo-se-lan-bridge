@@ -204,6 +204,28 @@ class VideoAndAudioPublicationTests(unittest.TestCase):
         self.assertIn("-vn", command)
         self.assertEqual(popen.call_args.kwargs["pass_fds"], (17,))
 
+    def test_video_quality_uses_rola_vendor_payload(self):
+        bridge = ebo_server.Bridge.__new__(ebo_server.Bridge)
+        bridge.video_quality = None
+        bridge.video_quality_updated = 0.0
+        calls = []
+        bridge.send_ioctl = lambda *args: calls.append(args)
+
+        result = bridge.set_video_quality("Medium")
+
+        self.assertEqual(calls, [(ebo_server.VIDEO_QUALITY_IOCTL,
+                                  struct.pack("<III", 2, 1500, 1))])
+        self.assertEqual(result["level"], "medium")
+        self.assertEqual(result["target_resolution"], "848x480")
+        self.assertEqual(result["target_bitrate_kbps"], 1500)
+        self.assertEqual(bridge.video_quality, "medium")
+
+    def test_video_quality_rejects_unknown_level_without_sending(self):
+        bridge = ebo_server.Bridge.__new__(ebo_server.Bridge)
+        bridge.send_ioctl = lambda *_: self.fail("invalid quality must not be sent")
+        with self.assertRaisesRegex(ValueError, "auto, high, medium, or low"):
+            bridge.set_video_quality("ultra")
+
 
 if __name__ == "__main__":
     unittest.main()

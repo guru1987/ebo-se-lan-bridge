@@ -48,6 +48,15 @@ AUDIO_FILTER = os.environ.get("EBO_AUDIO_FILTER", "none")
 RTSP_PATH = "ebo"
 RTSP_AUDIO_PATH = "ebo_audio"
 VIDEO_READY_TIMEOUT = float(os.environ.get("EBO_VIDEO_READY_TIMEOUT", "12"))
+VIDEO_QUALITY_IOCTL = int(os.environ.get("EBO_VIDEO_QUALITY_IOCTL", "0x990a"), 0)
+if VIDEO_QUALITY_IOCTL not in (0x9906, 0x990a):
+    raise ValueError("EBO_VIDEO_QUALITY_IOCTL must be 0x9906 or 0x990a")
+VIDEO_QUALITY_PROFILES = {
+    "auto": (0, 0, "adaptive"),
+    "high": (1, 4096, "1920x1080"),
+    "medium": (2, 1500, "848x480"),
+    "low": (3, 768, "848x480"),
+}
 STREAM_USER = os.environ.get("EBO_STREAM_USER", "ebo")
 STREAM_PASS = os.environ.get("EBO_STREAM_PASS", "")
 WEB_USER = os.environ.get("EBO_WEB_USER")
@@ -179,6 +188,8 @@ class Bridge:
         self.last_task_ack = None
         self.file_server_info = None
         self.video_enabled = True
+        self.video_quality = None
+        self.video_quality_updated = 0.0
         self._published_frame_count = 0
         self._last_published_frame = 0.0
         self._video_start_publish_count = -1
@@ -635,6 +646,25 @@ class Bridge:
                 self._state_condition.wait(remaining)
             return True
 
+    def set_video_quality(self, level: str):
+        level = str(level).strip().lower()
+        try:
+            wire_level, bitrate_kbps, resolution = VIDEO_QUALITY_PROFILES[level]
+        except KeyError as exc:
+            raise ValueError("level must be auto, high, medium, or low") from exc
+        # ROLA uses three little-endian uint32 values: level, bitrate target,
+        # and an enable/apply flag. The robot persists the selected profile.
+        self.send_ioctl(VIDEO_QUALITY_IOCTL, struct.pack("<III", wire_level, bitrate_kbps, 1))
+        self.video_quality = level
+        self.video_quality_updated = time.time()
+        return {
+            "accepted": True,
+            "level": level,
+            "target_resolution": resolution,
+            "target_bitrate_kbps": bitrate_kbps or None,
+            "ioctrl": hex(VIDEO_QUALITY_IOCTL),
+        }
+
     def open_media_client(self):
         with self._state_condition:
             before = (self.file_server_info or {}).get("updated", 0)
@@ -821,6 +851,7 @@ def info():
         "frames_received": bridge.frame_count if bridge else 0,
         "video_enabled": bridge.video_enabled if bridge else False,
         "video_ready": bridge.video_ready() if bridge else False,
+        "video_quality": bridge.video_quality if bridge else None,
         "audio": ({"codec": f"0x{bridge.audio_codec:02x}", "flags": f"0x{bridge.audio_flags:02x}",
                    "count": bridge.audio_count, "active": now - bridge.last_audio < 2.0,
                    "last_received": bridge.last_audio}
@@ -836,6 +867,10 @@ def info():
 
 class ParameterWrite(BaseModel):
     value: float
+
+
+class VideoQualityWrite(BaseModel):
+    level: str
 
 
 @app.get("/parameters")
@@ -891,6 +926,30 @@ def video(state: str):
     return {"ok": True, "video_enabled": bridge.video_enabled,
             "video_ready": bridge.video_ready(), "audio_preserved": True,
             "talkback_preserved": True}
+
+
+@app.get("/video/quality")
+def video_quality():
+    return {
+        "level": bridge.video_quality,
+        "updated": bridge.video_quality_updated or None,
+        "ioctrl": hex(VIDEO_QUALITY_IOCTL),
+        "profiles": {
+            name: {"target_resolution": profile[2],
+                   "target_bitrate_kbps": profile[1] or None}
+            for name, profile in VIDEO_QUALITY_PROFILES.items()
+        },
+        "note": "level is the last bridge request; this firmware provides no quality readback",
+    }
+
+
+@app.put("/video/quality")
+def video_quality_write(body: VideoQualityWrite):
+    try:
+        result = bridge.set_video_quality(body.level)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result}
 
 
 @app.post("/debug/ioctl")

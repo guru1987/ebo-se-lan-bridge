@@ -39,9 +39,9 @@
     `GET /media` listed five card items and `GET /media/{name}` downloaded an
     existing 486,484-byte JPEG with a valid JPEG signature.
 
-13. **Camera controls — substantially implemented, partly live validated**
-    Day/night state read back as automatic mode. Full-HD photo, forced colour/IR,
-    and video start/stop are exposed but still await hands-on live validation.
+13. **Camera controls — substantially implemented and partly live validated**
+    Live-view Auto/High/Medium/Low quality, video start/stop, and day/night state
+    reads are validated. Full-HD photo and forced colour/IR still await live validation.
 
 14. **Security-event integration — partial**
     Settings and schedules exist; event history and complete notifications remain pending.
