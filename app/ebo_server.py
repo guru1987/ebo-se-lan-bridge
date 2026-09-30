@@ -12,7 +12,7 @@ Web panel:     EBO_WEB_USER EBO_WEB_PASS               (HTTP basic; disabled if 
 MQTT:          EBO_MQTT_HOST [EBO_MQTT_PORT EBO_MQTT_USER EBO_MQTT_PASS]
 Other:         EBO_DIR (/opt/ebo)  EBO_PORT (8000)  EBO_BIND (127.0.0.1)
 """
-import os, time, struct, threading, subprocess, secrets, socket, base64, urllib.request, urllib.error, http.cookiejar, tempfile
+import os, json, time, struct, threading, subprocess, secrets, socket, base64, urllib.request, urllib.error, http.cookiejar, tempfile
 from dataclasses import replace
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -737,11 +737,181 @@ def do_action(name: str) -> bool:
         return False
     return True
 
+# ---------------- forward-move depth guard (opt-in) ----------------
+# EBO_DEPTH_GUARD_URL = a depth service's live endpoint (ebo-depth GET /depth/live: JSON
+# {"reading": {"free_ahead_m", "free_ahead_kind", "frame_t", ...} | null, "running"}; each
+# poll also keeps its stream decoder running). While a FORWARD move runs (ly > 0, /move or
+# /drive) a thread polls it every GUARD_POLL_S and stops the robot at once when:
+#   free_ahead_m < stop_free_m, free_ahead_m is null (no metric scale / unknown), the view is
+#   blocked (free 0), or the depth is down / has no reading / is older than GUARD_STALE_S.
+# A forward /move first waits (<= EBO_GUARD_START_WAIT_S) for one fresh good reading and does
+# not move without it. Turning (ly == 0) and backing (ly < 0) are never blocked.
+# stop_free_m: key of the JSON file EBO_GUARD_CONFIG (ebo-eye's body_config.json, which
+# validates it 0.05..1.5), re-read when the file changes; missing/invalid -> 0.25.
+GUARD_URL = os.environ.get("EBO_DEPTH_GUARD_URL", "").strip()
+GUARD_CONFIG = os.environ.get("EBO_GUARD_CONFIG", "").strip()
+GUARD_START_WAIT_S = float(os.environ.get("EBO_GUARD_START_WAIT_S", "5"))
+GUARD_STALE_S = 0.5
+GUARD_POLL_S = 0.03
+STOP_FREE_DEFAULT, STOP_FREE_MIN, STOP_FREE_MAX = 0.25, 0.05, 1.5
+
+
+class DepthGuard:
+    def __init__(self, url, cfg_path, user, password):
+        self.url, self.cfg_path = url, cfg_path
+        self.hdr = ({"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
+                    if user else {})
+        self.op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.lock = threading.Lock()   # motor frames of guarded moves and guard stops go through it
+        self.poll_until = 0.0          # monotonic: poll the depth until then
+        self.forward_until = 0.0       # monotonic: forward motion commanded until then
+        self.move_id = 0
+        self.trip = None               # {"move_id", "reason", reading...} of the last guard stop
+        self.verdict = (False, {"reason": "no depth reading yet"}, 0.0)   # (ok, info, monotonic t)
+        self._cfg = (None, STOP_FREE_DEFAULT)
+        threading.Thread(target=self._loop, name="depth-guard", daemon=True).start()
+
+    def stop_free_m(self):
+        try:
+            mt = os.stat(self.cfg_path).st_mtime if self.cfg_path else None
+        except OSError:
+            mt = None
+        if mt is None:
+            return STOP_FREE_DEFAULT
+        if mt != self._cfg[0]:
+            v = STOP_FREE_DEFAULT
+            try:
+                with open(self.cfg_path) as f:
+                    x = json.load(f).get("stop_free_m")
+                if isinstance(x, (int, float)) and not isinstance(x, bool) and STOP_FREE_MIN <= x <= STOP_FREE_MAX:
+                    v = float(x)
+            except (OSError, ValueError, AttributeError):
+                pass
+            self._cfg = (mt, v)
+        return self._cfg[1]
+
+    def check(self):
+        """Poll the depth once -> (ok, info). Anything but a fresh reading with enough room is not ok."""
+        stop = self.stop_free_m()
+        info = {"stop_free_m": stop}
+        try:
+            with self.op.open(urllib.request.Request(self.url, headers=self.hdr), timeout=0.3) as r:
+                st = json.loads(r.read())
+        except Exception as e:
+            info["reason"] = f"depth down ({type(e).__name__})"
+            return False, info
+        rd = st.get("reading")
+        if not rd:
+            info["reason"] = "no depth reading yet" if st.get("running") else "depth not running"
+            return False, info
+        free = rd.get("free_ahead_m")
+        age = time.time() - float(rd.get("frame_t") or 0)
+        info.update(free_ahead_m=free, free_ahead_kind=rd.get("free_ahead_kind"), depth_age_s=round(age, 2),
+                    floor=rd.get("floor_source"))
+        if age > GUARD_STALE_S:
+            info["reason"] = f"depth stale ({age:.2f} s old)"
+        elif free is None:
+            info["reason"] = "distance ahead unknown (no floor scale)"
+        elif rd.get("view_blocked"):
+            info["reason"] = "view blocked"
+        elif free < stop:
+            info["reason"] = f"too close: {free:.2f} m free ahead < stop_free_m {stop:.2f}"
+        else:
+            return True, info
+        return False, info
+
+    def _loop(self):
+        while True:
+            now = time.monotonic()
+            if now >= self.poll_until and now >= self.forward_until:
+                time.sleep(0.01)
+                continue
+            ok, info = self.check()
+            self.verdict = (ok, info, time.monotonic())
+            if not ok:
+                with self.lock:
+                    if time.monotonic() < self.forward_until:
+                        self.forward_until = 0.0
+                        self.trip = {"move_id": self.move_id, **info}
+                        for _ in range(3):
+                            bridge.send_rdt(motor_frame())
+                if self.trip and self.trip.get("move_id") == self.move_id and "logged" not in self.trip:
+                    self.trip["logged"] = True
+                    print(f"[guard] STOP: {json.dumps(info)}", flush=True)
+            time.sleep(GUARD_POLL_S)
+
+    def want(self, s=1.0):
+        self.poll_until = max(self.poll_until, time.monotonic() + s)
+
+    def fresh_verdict(self, since, max_age=0.15):
+        ok, info, t = self.verdict
+        return (ok, info) if t >= since and time.monotonic() - t <= max_age else None
+
+    def wait_ready(self, timeout):
+        """Before a forward move: one fresh verdict taken after this call; wait for a good one."""
+        t0 = time.monotonic()
+        last = (False, {"reason": "no depth reading yet", "stop_free_m": self.stop_free_m()})
+        while time.monotonic() - t0 < timeout:
+            self.want()
+            v = self.fresh_verdict(t0)
+            if v:
+                last = v
+                if v[0]:
+                    return v
+            time.sleep(0.02)
+        return last
+
+
+guard = None
+
+
+def _guard_result(info, phase, moved_s=0.0):
+    out = {"ok": False, "stopped_by_guard": True, "phase": phase, "moved_s": round(moved_s, 2)}
+    out.update({k: v for k, v in info.items() if k not in ("move_id", "logged")})
+    return out
+
+
 def do_move(ly: float, rx: float, duration: float = 0.4):
+    """Returns {"ok": True, ...} or, when the depth guard stopped/refused a forward move,
+    {"ok": False, "stopped_by_guard": True, "phase": "start"|"moving", "reason", "free_ahead_m", ...}."""
     n = max(1, int(duration * 20))
+    if guard is None or ly <= 0:
+        for _ in range(n):
+            bridge.send_rdt(motor_frame(ly=ly, rx=rx)); time.sleep(0.05)
+        bridge.send_rdt(motor_frame())
+        return {"ok": True} if guard is not None or ly <= 0 else {"ok": True, "guard": "off"}
+    ok, info = guard.wait_ready(GUARD_START_WAIT_S)
+    if not ok:
+        bridge.send_rdt(motor_frame())
+        print(f"[guard] refused forward move: {json.dumps(info)}", flush=True)
+        return _guard_result(info, "start")
+    with guard.lock:
+        guard.move_id += 1
+        mid = guard.move_id
+        guard.trip = None
+        guard.forward_until = time.monotonic() + duration + 0.3
+    start_info = info
+    t0 = time.monotonic()
+    tripped = None
     for _ in range(n):
-        bridge.send_rdt(motor_frame(ly=ly, rx=rx)); time.sleep(0.05)
-    bridge.send_rdt(motor_frame())
+        with guard.lock:
+            tr = guard.trip
+            if tr is not None and tr.get("move_id") == mid:
+                tripped = tr
+                break
+            bridge.send_rdt(motor_frame(ly=ly, rx=rx))
+        time.sleep(0.05)
+    with guard.lock:
+        if guard.move_id == mid:
+            guard.forward_until = 0.0
+        bridge.send_rdt(motor_frame())
+    moved = time.monotonic() - t0
+    if tripped is not None:
+        return _guard_result(tripped, "moving", moved)
+    ok, last, _ = guard.verdict
+    return {"ok": True, "moved_s": round(moved, 2),
+            "guard": {"free_ahead_m_start": start_info.get("free_ahead_m"),
+                      "free_ahead_m_end": last.get("free_ahead_m"), "stop_free_m": last.get("stop_free_m")}}
 
 
 # ---------------- HTTP API + web panel (optional basic auth) ----------------
@@ -1103,7 +1273,7 @@ class Move(BaseModel):
 
 @app.post("/move")
 def move(m: Move):
-    do_move(m.ly, m.rx, m.duration); return {"ok": True}
+    return do_move(m.ly, m.rx, m.duration)
 
 # Analog joystick: the panel POSTs the current vector at ~15 Hz while dragging. Each call
 # sends ONE motor frame (no trailing stop) so motion is continuous; a server-side watchdog
@@ -1113,6 +1283,21 @@ _last_drive = 0.0
 @app.post("/drive")
 def drive(m: Move):
     global _last_drive
+    if guard is not None and m.ly > 0:
+        # forward: only on a fresh good depth verdict; the guard thread stops it mid-way
+        t_call = time.monotonic()
+        guard.want(1.0)
+        with guard.lock:
+            v = guard.fresh_verdict(t_call - 0.15)
+            if v is None or not v[0]:
+                bridge.send_rdt(motor_frame())
+                _last_drive = 0.0
+                info = v[1] if v else {"reason": "waiting for depth", "stop_free_m": guard.stop_free_m()}
+                return _guard_result(info, "drive")
+            guard.forward_until = time.monotonic() + 0.4
+            bridge.send_rdt(motor_frame(ly=m.ly, rx=m.rx))
+        _last_drive = time.time()
+        return {"ok": True}
     bridge.send_rdt(motor_frame(ly=m.ly, rx=m.rx))
     _last_drive = time.time()
     return {"ok": True}
@@ -1202,6 +1387,10 @@ async def talk(websocket: WebSocket):
 if __name__ == "__main__":
     bridge = Bridge()
     threading.Thread(target=_drive_watchdog, daemon=True).start()
+    if GUARD_URL:
+        guard = DepthGuard(GUARD_URL, GUARD_CONFIG, WEB_USER, WEB_PASS)
+        print(f"[guard] forward-move depth guard on (config {GUARD_CONFIG or '-'}, "
+              f"stop_free_m {guard.stop_free_m():.2f})", flush=True)
     mqtt_host = os.environ.get("EBO_MQTT_HOST")
     if mqtt_host:
         try:
