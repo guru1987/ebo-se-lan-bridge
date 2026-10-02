@@ -320,7 +320,8 @@ class DockGuardRailTests(unittest.TestCase):
             r = c.post("/action/undock").json()
         self.assertTrue(r["ok"])
         self.assertEqual(r["action"], "undock")
-        self.assertEqual(c.post("/action/dock").json(), {"ok": True, "action": "dock"})
+        self.assertEqual(c.post("/action/dock").json(),
+                         {"ok": True, "action": "dock", "dockwatch": {"watching": False}})
 
 
 class VideoAndAudioPublicationTests(unittest.TestCase):
@@ -522,6 +523,55 @@ class GuardWakeTests(unittest.TestCase):
         self.assertNotIn("woke", info)
         self.assertEqual(self.fake.set_video_calls, 0)
 
+    def test_after_wake_waits_for_a_reading_with_floor_scale(self):
+        """Live 2026-10-02: the first readings after a wake had no floor scale yet -> wait for one."""
+        state = {}
+
+        def script(_t):
+            if self.fake.set_video_calls == 0:
+                return NO_READING
+            state.setdefault("t", time.monotonic())
+            dt = time.monotonic() - state["t"]
+            if dt < 0.1:
+                return {"reason": "no depth reading yet", "no_fresh_reading": True, "depth_running": True}
+            if dt < 0.6:   # fresh, but no floor scale (camera settling)
+                return {"reason": "distance ahead unknown (no floor scale)", "no_scale": True,
+                        "free_ahead_m": None, "depth_running": True}
+            return good(0.45)
+        g = ScriptedGuard(script)
+        ok, info = g.wait_ready(0.1, wake_wait=0.2, scale_wait=1.5)   # stream-up wait alone too short
+        self.assertTrue(ok, info)
+        self.assertTrue(info["woke"])
+        self.assertEqual(info["free_ahead_m"], 0.45)
+
+    def test_after_wake_refused_when_no_scaled_reading_arrives(self):
+        def script(_t):
+            if self.fake.set_video_calls == 0:
+                return NO_READING
+            return {"reason": "distance ahead unknown (no floor scale)", "no_scale": True,
+                    "free_ahead_m": None, "depth_running": True}
+        g = ScriptedGuard(script)
+        t0 = time.monotonic()
+        ok, info = g.wait_ready(0.1, wake_wait=0.1, scale_wait=0.5)
+        waited = time.monotonic() - t0
+        self.assertFalse(ok)
+        self.assertTrue(info["woke"])
+        self.assertIn("no floor scale", info["reason"])
+        self.assertGreater(waited, 0.45)
+        self.assertLess(waited, 1.2)
+
+    def test_after_wake_first_scaled_reading_decides_at_once(self):
+        def script(_t):
+            if self.fake.set_video_calls == 0:
+                return NO_READING
+            return too_close(0.12)
+        g = ScriptedGuard(script)
+        t0 = time.monotonic()
+        ok, info = g.wait_ready(0.1, wake_wait=2.0, scale_wait=3.0)
+        self.assertFalse(ok)
+        self.assertEqual(info["free_ahead_m"], 0.12)
+        self.assertLess(time.monotonic() - t0, 0.8)
+
     def test_wake_asks_ebo_eye_first(self):
         g = ScriptedGuard(lambda _t: NO_READING)
         keep = mock.Mock(side_effect=lambda: setattr(self.fake, "video", True))
@@ -653,6 +703,166 @@ class UndockTests(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertTrue(r["guard"]["woke"])
         self.assertTrue(r["left_dock"])
+
+
+class ScriptedDockWatch(ebo_server.DockWatch):
+    """Real DockWatch thread/logic; fetch() plays a list of wide-corridor free distances, one fresh
+    reading (new seq) per poll; after the list it keeps returning the last one (no new reading)."""
+
+    def __init__(self, values, on_poll=None):
+        super().__init__("http://127.0.0.1:9/none", None, None)
+        self.values, self.i, self.on_poll = list(values), 0, on_poll
+
+    def fetch(self):
+        if self.on_poll:
+            self.on_poll(self.i)
+        i = min(self.i, len(self.values) - 1)
+        self.i += 1
+        v = self.values[i]
+        return {"seq": i, "frame_t": time.time(), "free_ahead_m": v, "free_ahead_kind": "obstacle",
+                "free_ahead_wide_m": v, "free_ahead_wide_kind": "obstacle", "wide_half_width_m": 0.17}
+
+
+class DockWatchTests(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeVideoBridge(charge=0, video=True)
+        for p in (mock.patch.object(ebo_server, "bridge", self.fake),
+                  mock.patch.object(ebo_server, "guard", None),
+                  mock.patch.object(ebo_server, "DOCKWATCH_POLL_S", 0.005),
+                  mock.patch.object(ebo_server, "DOCKWATCH_CONFIRM_S", 0.15),
+                  mock.patch.object(ebo_server, "DOCKWATCH_TIMEOUT_S", 2.0),
+                  mock.patch.object(ebo_server, "GUARD_VIDEO_KEEP_URL", ""),
+                  mock.patch.object(ebo_server, "WEB_USER", None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_watch(self, values, on_poll=None, timeout=3.0):
+        w = ScriptedDockWatch(values, on_poll)
+        self.watch = w
+        with mock.patch.object(ebo_server, "dockwatch", w):
+            w.start()
+            t0 = time.monotonic()
+            while w.status()["active"] and time.monotonic() - t0 < timeout:
+                time.sleep(0.01)
+        return w
+
+    def stops(self):
+        return self.fake.count(ebo_server.motor_frame())
+
+    def test_approach_toward_obstacle_stops(self):
+        w = self.run_watch([0.6, 0.5, 0.42, 0.35, 0.29, 0.24, 0.2])
+        ev = w.status()["last_event"]
+        self.assertEqual(ev["kind"], "stopped", ev)
+        self.assertEqual(ev["free_m"], 0.24)
+        self.assertEqual(ev["message"], "docking stopped: obstacle 0.24 m ahead")
+        self.assertGreaterEqual(self.stops(), 5)
+        self.assertEqual(w.take_notice(), "docking stopped: obstacle 0.24 m ahead")
+        self.assertIsNone(w.take_notice())   # once
+
+    def test_still_closing_after_stop_resends(self):
+        w = self.run_watch([0.4, 0.33, 0.28, 0.24, 0.21, 0.18, 0.15])
+        ev = w.status()["last_event"]
+        self.assertEqual(ev["kind"], "stopped")
+        self.assertTrue(ev.get("still_closing_after_stop"), ev)
+        self.assertGreaterEqual(ev["resends"], 1)
+        self.assertGreaterEqual(self.stops(), 10)
+
+    def test_reversing_with_growing_distance_does_not_stop(self):
+        w = self.run_watch([0.12, 0.14, 0.17, 0.2, 0.22, 0.25, 0.3], on_poll=self.dock_after(10))
+        self.assertEqual(w.status()["last_event"]["kind"], "docked")
+        self.assertEqual(self.stops(), 0)
+
+    def test_stable_close_distance_does_not_stop(self):
+        w = self.run_watch([0.2, 0.2, 0.21, 0.2, 0.2, 0.21, 0.2], on_poll=self.dock_after(10))
+        self.assertEqual(w.status()["last_event"]["kind"], "docked")
+        self.assertEqual(self.stops(), 0)
+
+    def test_turning_in_place_does_not_stop(self):
+        # the view sweeps: distances jump around rather than closing steadily
+        w = self.run_watch([1.2, 0.22, 0.9, 0.18, 0.5, 0.2, 1.5, 0.15, 0.7], on_poll=self.dock_after(12))
+        self.assertEqual(w.status()["last_event"]["kind"], "docked")
+        self.assertEqual(self.stops(), 0)
+
+    def test_far_approach_does_not_stop(self):
+        w = self.run_watch([1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3], on_poll=self.dock_after(12))
+        self.assertEqual(self.stops(), 0)
+
+    def test_charging_ends_the_watch(self):
+        self.fake.charge = 1
+        w = self.run_watch([0.6, 0.4, 0.2])
+        ev = w.status()["last_event"]
+        self.assertEqual(ev["kind"], "docked")
+        self.assertFalse(w.status()["active"])
+        self.assertEqual(self.stops(), 0)
+
+    def test_timeout_ends_the_watch(self):
+        with mock.patch.object(ebo_server, "DOCKWATCH_TIMEOUT_S", 0.2):
+            w = self.run_watch([0.8])
+        self.assertEqual(w.status()["last_event"]["kind"], "timeout")
+
+    def test_no_reading_never_stops(self):
+        w = ScriptedDockWatch([0.1])
+        w.fetch = lambda: None
+        with mock.patch.object(ebo_server, "DOCKWATCH_TIMEOUT_S", 0.2), mock.patch.object(ebo_server, "dockwatch", w):
+            w.start()
+            time.sleep(0.4)
+        ev = w.status()["last_event"]
+        self.assertEqual(ev["kind"], "timeout")
+        self.assertGreater(ev["blind"], 0)
+        self.assertEqual(self.stops(), 0)
+
+    def test_falls_back_to_narrow_corridor(self):
+        w = ScriptedDockWatch([0.5, 0.4, 0.3, 0.24, 0.2])
+        orig = w.fetch
+
+        def narrow():
+            rd = orig()
+            for k in ("free_ahead_wide_m", "free_ahead_wide_kind", "wide_half_width_m"):
+                rd.pop(k)
+            return rd
+        w.fetch = narrow
+        with mock.patch.object(ebo_server, "dockwatch", w):
+            w.start()
+            time.sleep(0.5)
+        ev = w.status()["last_event"]
+        self.assertEqual(ev["kind"], "stopped")
+        self.assertIn("narrow", ev["corridor"])
+
+    def dock_after(self, n):
+        def on_poll(i):
+            if i >= n:
+                self.fake.charge = 1
+        return on_poll
+
+    def test_dock_action_starts_watch_and_notice_reaches_next_result(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        w = ScriptedDockWatch([0.6, 0.5, 0.4, 0.33, 0.27, 0.22])
+        with mock.patch.object(ebo_server, "dockwatch", w):
+            c = TestClient(ebo_server.app)
+            r = c.post("/action/dock").json()
+            self.assertTrue(r["ok"])
+            self.assertTrue(r["dockwatch"]["watching"])
+            self.assertEqual(self.fake.count(ebo_server.command_frame(ebo_server.CMD_DOCK)), 5)
+            t0 = time.monotonic()
+            while w.status()["active"] and time.monotonic() - t0 < 3:
+                time.sleep(0.01)
+            st = c.get("/dockwatch").json()
+            self.assertEqual(st["last_event"]["kind"], "stopped")
+            info = ebo_server.dockwatch_brief()
+            self.assertEqual(info["last_event"]["kind"], "stopped")
+            r2 = c.post("/move", json={"ly": 0, "rx": 0.3}).json()
+            self.assertEqual(r2.get("dockwatch_notice"), "docking stopped: obstacle 0.22 m ahead")
+            r3 = c.post("/move", json={"ly": 0, "rx": 0.3}).json()
+            self.assertNotIn("dockwatch_notice", r3)
+
+    def test_dock_action_without_watch(self):
+        with mock.patch.object(ebo_server, "dockwatch", None), \
+                mock.patch.object(ebo_server.time, "sleep", lambda _s: None):
+            self.assertTrue(ebo_server.do_action("dock"))
+        self.assertEqual(self.fake.count(ebo_server.command_frame(ebo_server.CMD_DOCK)), 5)
 
 
 if __name__ == "__main__":

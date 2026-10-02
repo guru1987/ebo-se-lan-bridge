@@ -54,7 +54,26 @@ decoder idle or the video paused by ebo-eye) first wake the stream: ebo-eye
 `POST EBO_GUARD_VIDEO_KEEP_URL` (`/video_keep`), then the bridge's own video start if it is
 still not publishing; the guard's `/depth/live` polls keep the depth decoder running. They then
 wait until the stream is up plus `EBO_GUARD_WAKE_WAIT_S` (3 s) for a fresh reading (at most
-`EBO_GUARD_WAKE_MAX_S`, 10 s, after the wake) and still refuse without one. Logged as `[guard]`.
+`EBO_GUARD_WAKE_MAX_S`, 10 s, after the wake) and still refuse without one. After a wake only a
+fresh reading WITH a floor scale (`free_ahead_m` not null) decides: the first readings after a
+wake often have no floor fit yet, so fresh unscaled readings extend the wait to
+`EBO_GUARD_SCALE_WAIT_S` (8 s) after the wake (same cap). Logged as `[guard]`.
+
+Dock watch: `POST /action/dock` (and MQTT dock) starts the vendor's firmware dock routine (search
+turns, a weaving forward approach camera-first, a 180 degree turn, reversing in), which the forward
+guard never sees. A `DockWatch` thread then polls the depth (`EBO_DOCKWATCH_URL`, default the
+guard's `/depth/live`) every `EBO_DOCKWATCH_POLL_S` (0.1 s) until charge == 1 or
+`EBO_DOCKWATCH_TIMEOUT_S` (120 s) and sends motor-zero stop frames when the free distance in the
+depth service's wide corridor (`free_ahead_wide_m`, robot half width + `wide_corridor_margin_m`
+per side; falls back to `free_ahead_m`) is below `EBO_DOCKWATCH_STOP_M` (0.25 m) and has shrunk
+over the last `EBO_DOCKWATCH_SHRINK_N` (3) fresh readings (no step growing, none larger than
+`EBO_DOCKWATCH_MAX_STEP_M` 0.15 m, at least `EBO_DOCKWATCH_MIN_SHRINK_M` 0.02 m in total).
+Reversing (growing) and turning (jumping/holding) do not trigger; no reading never stops it. After a
+stop it re-sends the stop for `EBO_DOCKWATCH_CONFIRM_S` (3 s) if the distance keeps closing
+(`still_closing_after_stop`: the firmware ignored the stop). Whether motor-zero frames interrupt the
+firmware routine is untested. State: `GET /dockwatch`, `/info` `dockwatch`; a stop is attached once
+to the next `/action` or `/move` result as `dockwatch_notice` ("docking stopped: obstacle 0.20 m
+ahead"). Logged as `[dockwatch]`. `EBO_DOCKWATCH=0` disables it.
 
 `GET /actions` lists every accepted action name; tricks carry `"moves": true` and their
 command number.

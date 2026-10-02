@@ -735,6 +735,8 @@ class Bridge:
 def do_action(name: str) -> bool:
     if name == "dock":
         for _ in range(5): bridge.send_rdt(command_frame(CMD_DOCK)); time.sleep(0.15)
+        if dockwatch is not None:
+            dockwatch.start()
     elif name in SPECIAL_MOTION_COMMANDS:
         # ROLA sends exactly one COMMAND_MINI frame for a selected motion.
         bridge.send_rdt(command_frame(SPECIAL_MOTION_COMMANDS[name]))
@@ -767,12 +769,16 @@ def do_action(name: str) -> bool:
 # ebo-eye POST EBO_GUARD_VIDEO_KEEP_URL, then the bridge's own video start if still not ready;
 # the guard's /depth/live polls keep the depth decoder running), then waits until the stream is
 # up (video publishing + depth decoder running) and EBO_GUARD_WAKE_WAIT_S more for a fresh
-# reading (at most EBO_GUARD_WAKE_MAX_S after the wake). Still none -> refused. Logged [guard].
+# reading (at most EBO_GUARD_WAKE_MAX_S after the wake). After a wake the guard decides only on a
+# fresh reading WITH a floor scale (free_ahead_m not null): the first readings after a wake often
+# have none yet (camera settling, no floor fit), so once fresh readings flow it waits up to
+# EBO_GUARD_SCALE_WAIT_S after the wake (same cap) for a scaled one. Still none -> refused. [guard].
 GUARD_URL = os.environ.get("EBO_DEPTH_GUARD_URL", "").strip()
 GUARD_CONFIG = os.environ.get("EBO_GUARD_CONFIG", "").strip()
 GUARD_START_WAIT_S = float(os.environ.get("EBO_GUARD_START_WAIT_S", "5"))
 GUARD_WAKE_WAIT_S = float(os.environ.get("EBO_GUARD_WAKE_WAIT_S", "3"))
 GUARD_WAKE_MAX_S = float(os.environ.get("EBO_GUARD_WAKE_MAX_S", "10"))
+GUARD_SCALE_WAIT_S = float(os.environ.get("EBO_GUARD_SCALE_WAIT_S", "8"))
 GUARD_VIDEO_KEEP_URL = os.environ.get("EBO_GUARD_VIDEO_KEEP_URL", "").strip()
 GUARD_DRIVE_WAIT_S = 0.3   # /drive: how long one call waits for a verdict before deciding to wake
 GUARD_STALE_S = 0.5
@@ -842,6 +848,7 @@ class DepthGuard:
             info["no_fresh_reading"] = True
         elif free is None:
             info["reason"] = "distance ahead unknown (no floor scale)"
+            info["no_scale"] = True
         elif rd.get("view_blocked"):
             info["reason"] = "view blocked"
         elif free < stop:
@@ -922,15 +929,20 @@ class DepthGuard:
         """Video publishing and the depth decoder running (a fresh reading should follow)."""
         return bool(info.get("depth_running")) and bridge.video_ready()
 
-    def wait_ready(self, timeout, wake_wait=None):
+    def wait_ready(self, timeout, wake_wait=None, scale_wait=None):
         """Before a forward move: one fresh verdict taken after this call; wait for a good one.
         If the verdict says there is no fresh reading, wake the stream (see wake) and wait until
         it is up plus wake_wait (GUARD_WAKE_WAIT_S) for a fresh reading, at most GUARD_WAKE_MAX_S
-        after the wake; never shorter than timeout. The result's info carries "woke" then."""
+        after the wake; never shorter than timeout. After a wake only a fresh reading with a floor
+        scale (free_ahead_m not null) decides (ok or refused at once); fresh unscaled readings extend
+        the wait to scale_wait (GUARD_SCALE_WAIT_S) after the wake, same cap. The result's info
+        carries "woke" then."""
         wake_wait = GUARD_WAKE_WAIT_S if wake_wait is None else wake_wait
+        scale_wait = GUARD_SCALE_WAIT_S if scale_wait is None else scale_wait
         t0 = time.monotonic()
         deadline = t0 + timeout
         woke = up_since = None
+        fresh_seen = False   # after the wake: a fresh reading arrived (maybe without a floor scale)
         last = (False, {"reason": "no depth reading yet", "stop_free_m": self.stop_free_m()})
         while True:
             now = time.monotonic()
@@ -946,11 +958,21 @@ class DepthGuard:
                           f"waiting up to {wake_wait:.1f} s once it is up", flush=True)
                     self.wake()
                 if woke is not None:
+                    if v[1].get("no_scale"):
+                        if not fresh_seen:
+                            fresh_seen = True
+                            print(f"[guard] fresh reading without a floor scale after the wake: waiting "
+                                  f"up to {scale_wait:.1f} s after the wake for a scaled one", flush=True)
+                    elif not v[1].get("no_fresh_reading") and v[1].get("free_ahead_m") is not None:
+                        break   # fresh and scaled but not ok (too close / blocked): decide now - refused
                     if self.stream_up(v[1]):
                         up_since = up_since or now
                     else:
                         up_since = None
-                    end = min(woke + GUARD_WAKE_MAX_S, (up_since + wake_wait) if up_since else woke + GUARD_WAKE_MAX_S)
+                    end = (up_since + wake_wait) if up_since else woke + GUARD_WAKE_MAX_S
+                    if fresh_seen:
+                        end = max(end, woke + scale_wait)
+                    end = min(woke + GUARD_WAKE_MAX_S, end)
                     deadline = max(t0 + timeout, end)
             if now >= deadline:
                 break
@@ -1067,6 +1089,197 @@ def do_undock(client: str = "-"):
         out["charge_polled_s"] = round(time.monotonic() - t0, 2)
     print(f"[undock] {json.dumps({**out, 'client': client})}", flush=True)
     return out
+
+
+# ---- dock watch: the firmware dock routine (CMD_DOCK) is not a bridge move, so the forward guard
+# never sees it. The routine searches (turns), approaches the dock's axis FORWARD camera-first while
+# weaving left-right, turns 180 deg and reverses in. After a dock action a DockWatch thread polls the
+# depth (EBO_DOCKWATCH_URL, default the guard's /depth/live; each poll also holds its decoder) every
+# EBO_DOCKWATCH_POLL_S until charge == 1 or EBO_DOCKWATCH_TIMEOUT_S, and STOPS the robot (motor-zero
+# frames - whether they interrupt the firmware routine is untested) when the free distance in the
+# WIDE corridor (depth reading free_ahead_wide_m: robot half width + depth config
+# wide_corridor_margin_m per side; falls back to free_ahead_m) is < EBO_DOCKWATCH_STOP_M AND it has
+# been shrinking over the last EBO_DOCKWATCH_SHRINK_N fresh readings (each step not growing, each
+# step at most EBO_DOCKWATCH_MAX_STEP_M - bigger jumps are the view sweeping in a turn - and at least
+# EBO_DOCKWATCH_MIN_SHRINK_M in total) = driving toward it. Reversing into the dock (distance grows)
+# and turning in place (distance jumps or holds) do not trigger. After a STOP it watches
+# EBO_DOCKWATCH_CONFIRM_S more and re-sends the stop if the distance keeps closing
+# (still_closing_after_stop). No reading / stale: it never stops (fail-open, "blind" counted) and
+# wakes the stream. Logged [dockwatch]; GET /dockwatch, /info "dockwatch"; a STOP notice is attached
+# once to the next /action or /move result ("dockwatch_notice"). EBO_DOCKWATCH=0 disables it.
+DOCKWATCH_ON = os.environ.get("EBO_DOCKWATCH", "1").strip().lower() not in ("0", "false", "off", "no")
+DOCKWATCH_URL = os.environ.get("EBO_DOCKWATCH_URL", "").strip()
+DOCKWATCH_TIMEOUT_S = float(os.environ.get("EBO_DOCKWATCH_TIMEOUT_S", "120"))
+DOCKWATCH_STOP_M = float(os.environ.get("EBO_DOCKWATCH_STOP_M", "0.25"))
+DOCKWATCH_POLL_S = float(os.environ.get("EBO_DOCKWATCH_POLL_S", "0.1"))
+DOCKWATCH_SHRINK_N = max(2, int(os.environ.get("EBO_DOCKWATCH_SHRINK_N", "3")))
+DOCKWATCH_MIN_SHRINK_M = float(os.environ.get("EBO_DOCKWATCH_MIN_SHRINK_M", "0.02"))
+DOCKWATCH_MAX_STEP_M = float(os.environ.get("EBO_DOCKWATCH_MAX_STEP_M", "0.15"))
+DOCKWATCH_STALE_S = float(os.environ.get("EBO_DOCKWATCH_STALE_S", "1.0"))
+DOCKWATCH_CONFIRM_S = float(os.environ.get("EBO_DOCKWATCH_CONFIRM_S", "3.0"))
+DOCKWATCH_WAKE_EVERY_S = 5.0
+
+
+def dockwatch_config():
+    return {"timeout_s": DOCKWATCH_TIMEOUT_S, "stop_m": DOCKWATCH_STOP_M, "poll_s": DOCKWATCH_POLL_S,
+            "shrink_n": DOCKWATCH_SHRINK_N, "min_shrink_m": DOCKWATCH_MIN_SHRINK_M,
+            "max_step_m": DOCKWATCH_MAX_STEP_M, "stale_s": DOCKWATCH_STALE_S,
+            "confirm_s": DOCKWATCH_CONFIRM_S}
+
+
+def dock_approaching(values):
+    """values: the last free distances (oldest first). True = shrinking steadily (driving toward it)."""
+    if len(values) < DOCKWATCH_SHRINK_N:
+        return False
+    v = values[-DOCKWATCH_SHRINK_N:]
+    steps = [a - b for a, b in zip(v, v[1:])]   # positive = closer
+    return (all(0 <= s <= DOCKWATCH_MAX_STEP_M for s in steps)
+            and v[0] - v[-1] >= DOCKWATCH_MIN_SHRINK_M)
+
+
+class DockWatch:
+    def __init__(self, url, user, password):
+        self.url = url
+        self.hdr = ({"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
+                    if user else {})
+        self.op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.lock = threading.Lock()
+        self.watch_id = 0
+        self.current = None      # state of the running watch (None = idle)
+        self.last_event = None   # last watch end / STOP event
+        self.notice = None       # STOP message for the next /action or /move result
+        self.last_event_stop = None
+
+    def fetch(self):
+        """One /depth/live poll -> its reading dict (or None)."""
+        with self.op.open(urllib.request.Request(self.url, headers=self.hdr), timeout=0.5) as r:
+            return json.loads(r.read()).get("reading")
+
+    def start(self, client="-"):
+        with self.lock:
+            self.watch_id += 1
+            wid = self.watch_id
+            self.current = {"watch_id": wid, "started": time.time(), "client": client, "readings": 0,
+                            "blind": 0, "last_free_m": None, "corridor": None, "history": [],
+                            "stopped": False}
+        print(f"[dockwatch] watching dock routine #{wid} {json.dumps(dockwatch_config())}", flush=True)
+        threading.Thread(target=self._run, args=(wid,), name="dockwatch", daemon=True).start()
+        return {"watching": True, "watch_id": wid, "stop_m": DOCKWATCH_STOP_M, "timeout_s": DOCKWATCH_TIMEOUT_S}
+
+    def take_notice(self):
+        with self.lock:
+            n, self.notice = self.notice, None
+        return n
+
+    def status(self):
+        with self.lock:
+            cur = dict(self.current) if self.current else None
+            ev = dict(self.last_event) if self.last_event else None
+        if cur:
+            cur["elapsed_s"] = round(time.time() - cur["started"], 1)
+        return {"enabled": True, "active": cur is not None, "watch": cur, "last_event": ev,
+                "config": dockwatch_config()}
+
+    def _stop_robot(self):
+        lk = guard.lock if guard is not None else threading.Lock()
+        with lk:
+            for _ in range(5):
+                bridge.send_rdt(motor_frame())
+                time.sleep(0.02)
+
+    def _end(self, wid, event):
+        with self.lock:
+            if self.watch_id != wid:
+                return
+            cur = self.current or {}
+            event = {"watch_id": wid, "t": time.time(),
+                     "elapsed_s": round(time.time() - cur.get("started", time.time()), 1),
+                     "readings": cur.get("readings", 0), "blind": cur.get("blind", 0), **event}
+            self.last_event = event
+            self.current = None
+        print(f"[dockwatch] end {json.dumps(event)}", flush=True)
+
+    def _run(self, wid):
+        t0 = time.monotonic()
+        values, last_seq, last_wake = [], None, -1e9
+        stop_at = stop_free = None   # monotonic time / distance of the STOP
+        while True:
+            if self.watch_id != wid:
+                return   # superseded by a newer dock action
+            now = time.monotonic()
+            if bridge.charge == 1:
+                ev = {"kind": "docked", "message": "docked (charging)"}
+                if stop_at is not None:
+                    ev = {**self.last_event_stop, "kind": "stopped", "charging_after_stop": True}
+                return self._end(wid, ev)
+            if stop_at is not None and now - stop_at >= DOCKWATCH_CONFIRM_S:
+                return self._end(wid, {**self.last_event_stop, "final_free_m": values[-1] if values else None})
+            if now - t0 >= DOCKWATCH_TIMEOUT_S:
+                return self._end(wid, {"kind": "timeout",
+                                       "message": f"dock watch ended after {DOCKWATCH_TIMEOUT_S:.0f} s without charging"})
+            try:
+                rd = self.fetch()
+            except Exception:
+                rd = None
+            fresh = (rd is not None and rd.get("seq") != last_seq
+                     and time.time() - float(rd.get("frame_t") or 0) <= DOCKWATCH_STALE_S)
+            if not fresh:
+                if rd is None or time.time() - float(rd.get("frame_t") or 0) > DOCKWATCH_STALE_S:
+                    with self.lock:
+                        if self.current:
+                            self.current["blind"] += 1
+                    values = []
+                    if guard is not None and now - last_wake >= DOCKWATCH_WAKE_EVERY_S:
+                        last_wake = now
+                        guard.wake()
+                time.sleep(DOCKWATCH_POLL_S)
+                continue
+            last_seq = rd.get("seq")
+            if "free_ahead_wide_m" in rd:
+                free, kind, corridor = rd.get("free_ahead_wide_m"), rd.get("free_ahead_wide_kind"), "wide"
+                if rd.get("wide_half_width_m") is not None:
+                    corridor = f"wide +/-{rd['wide_half_width_m']:.2f} m"
+            else:
+                free, kind, corridor = rd.get("free_ahead_m"), rd.get("free_ahead_kind"), "narrow (no wide corridor)"
+            if free is None or kind == "blocked":
+                values = []   # unknown or blocked view: no trend
+            else:
+                values = (values + [float(free)])[-max(DOCKWATCH_SHRINK_N, 2):]
+            with self.lock:
+                if self.current and self.watch_id == wid:
+                    self.current.update(readings=self.current["readings"] + 1, last_free_m=free,
+                                        last_kind=kind, corridor=corridor, history=list(values))
+            if free is None or kind == "blocked":
+                time.sleep(DOCKWATCH_POLL_S)
+                continue
+            if stop_at is None:
+                if free < DOCKWATCH_STOP_M and dock_approaching(values):
+                    self._stop_robot()
+                    stop_at, stop_free = time.monotonic(), free
+                    msg = f"docking stopped: obstacle {free:.2f} m ahead"
+                    ev = {"kind": "stopped", "message": msg, "free_m": free, "corridor": corridor,
+                          "history": list(values), "stop_m": DOCKWATCH_STOP_M,
+                          "elapsed_s": round(now - t0, 1), "resends": 0}
+                    self.last_event_stop = ev
+                    with self.lock:
+                        if self.watch_id == wid:
+                            self.notice = msg
+                            self.last_event = {**ev, "watch_id": wid, "t": time.time(), "confirming": True}
+                            if self.current:
+                                self.current["stopped"] = True
+                    print(f"[dockwatch] STOP {json.dumps(ev)}", flush=True)
+            elif free <= stop_free - DOCKWATCH_MIN_SHRINK_M and dock_approaching(values):
+                # still closing after the STOP: the firmware routine may ignore motor-zero frames
+                self._stop_robot()
+                stop_free = free
+                self.last_event_stop = {**self.last_event_stop, "still_closing_after_stop": True,
+                                        "resends": self.last_event_stop["resends"] + 1, "min_free_m": free}
+                print(f"[dockwatch] still closing after STOP, stop re-sent {json.dumps(self.last_event_stop)}",
+                      flush=True)
+            time.sleep(DOCKWATCH_POLL_S)
+
+
+dockwatch = None
 
 
 # ---------------- HTTP API + web panel (optional basic auth) ----------------
@@ -1187,7 +1400,36 @@ def info():
         "telemetry": bridge.telemetry if bridge else {},
         "rtsp": f"rtsp://{ip}:8554/{RTSP_PATH}",
         "rtsp_audio": f"rtsp://{ip}:8554/{RTSP_AUDIO_PATH}",
+        "dockwatch": dockwatch_brief(),
     })
+
+
+def dockwatch_brief():
+    """Short dock-watch state for /info (full state: GET /dockwatch)."""
+    if dockwatch is None:
+        return {"enabled": False}
+    st = dockwatch.status()
+    w, ev = st["watch"], st["last_event"]
+    return {"enabled": True, "active": st["active"],
+            "last_free_m": w.get("last_free_m") if w else None,
+            "last_event": ({k: ev.get(k) for k in ("kind", "message", "free_m", "t", "still_closing_after_stop")
+                            if k in ev} if ev else None)}
+
+
+def with_dockwatch_notice(result):
+    """Attach a pending dock-watch STOP notice (once) to an action/move result for the brother."""
+    n = dockwatch.take_notice() if dockwatch is not None else None
+    if n and isinstance(result, dict):
+        result = {**result, "dockwatch_notice": n}
+    return result
+
+
+@app.get("/dockwatch")
+def dockwatch_state():
+    if dockwatch is None:
+        return {"enabled": False, "reason": "EBO_DOCKWATCH=0 or no depth URL",
+                "config": dockwatch_config()}
+    return dockwatch.status()
 
 
 class ParameterWrite(BaseModel):
@@ -1430,8 +1672,8 @@ class Move(BaseModel):
 def move(m: Move, request: Request):
     refusal = dock_refusal(m.ly, m.rx, request.client.host if request.client else "-", "move")
     if refusal is not None:
-        return refusal
-    return do_move(m.ly, m.rx, m.duration)
+        return with_dockwatch_notice(refusal)
+    return with_dockwatch_notice(do_move(m.ly, m.rx, m.duration))
 
 # Analog joystick: the panel POSTs the current vector at ~15 Hz while dragging. Each call
 # sends ONE motor frame (no trailing stop) so motion is continuous; a server-side watchdog
@@ -1553,11 +1795,25 @@ def do_trick(name: str, force: bool = False, client: str = "-"):
 
 @app.post("/action/{name}")
 def action(name: str, request: Request, force: int = 0):
+    client = request.client.host if request.client else "-"
     if name in SPECIAL_MOTION_COMMANDS:
-        return do_trick(name, bool(force), request.client.host if request.client else "-")
+        return with_dockwatch_notice(do_trick(name, bool(force), client))
     if name == "undock":
-        return do_undock(request.client.host if request.client else "-")
-    return {"ok": True, "action": name} if do_action(name) else {"ok": False, "err": "unknown"}
+        return with_dockwatch_notice(do_undock(client))
+    if name == "dock":
+        notice = dockwatch.take_notice() if dockwatch is not None else None   # an older STOP
+        do_action("dock")
+        out = {"ok": True, "action": "dock"}
+        if dockwatch is not None:
+            w = dockwatch.status()["watch"] or {}
+            out["dockwatch"] = {"watching": True, "watch_id": w.get("watch_id"), "stop_m": DOCKWATCH_STOP_M,
+                                "timeout_s": DOCKWATCH_TIMEOUT_S}
+        else:
+            out["dockwatch"] = {"watching": False}
+        if notice:
+            out["dockwatch_notice"] = notice
+        return out
+    return with_dockwatch_notice({"ok": True, "action": name} if do_action(name) else {"ok": False, "err": "unknown"})
 
 @app.post("/connection/{state}")
 def connection(state: str):
@@ -1628,6 +1884,11 @@ if __name__ == "__main__":
         guard = DepthGuard(GUARD_URL, GUARD_CONFIG, WEB_USER, WEB_PASS)
         print(f"[guard] forward-move depth guard on (config {GUARD_CONFIG or '-'}, "
               f"stop_free_m {guard.stop_free_m():.2f})", flush=True)
+    if DOCKWATCH_ON and (DOCKWATCH_URL or GUARD_URL):
+        dockwatch = DockWatch(DOCKWATCH_URL or GUARD_URL, WEB_USER, WEB_PASS)
+        print(f"[dockwatch] on ({DOCKWATCH_URL or GUARD_URL}) {json.dumps(dockwatch_config())}", flush=True)
+    else:
+        print("[dockwatch] off" + ("" if DOCKWATCH_ON else " (EBO_DOCKWATCH=0)"), flush=True)
     mqtt_host = os.environ.get("EBO_MQTT_HOST")
     if mqtt_host:
         try:
