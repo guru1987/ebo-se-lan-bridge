@@ -994,6 +994,11 @@ SYMMETRIC = [[-42, 1.0, "clear"], [-25, 0.3, "obstacle"], [-8, 0.24, "obstacle"]
 FAR_DECIDES = [[-42, 2.5, "far"], [-34, 2.4, "far"], [-25, 0.3, "obstacle"], [-8, 0.25, "obstacle"],
                [0, 0.24, "obstacle"], [8, 0.25, "obstacle"], [25, 0.3, "obstacle"], [34, 0.8, "clear"],
                [42, 0.7, "clear"]]
+# live 2026-10-02 ~21:12: box on the LEFT (L42 = 0.18 m), robot partly turned right, wide 0.13 m;
+# the old +/-25 deg window said "obstacle on the right" and turned left into the box
+LIVE_BOX_LEFT = [[-42, 0.18, "obstacle"], [-33, 1.45, "obstacle"], [-25, 1.39, "obstacle"],
+                 [-17, 1.15, "obstacle"], [-8, 1.0, "obstacle"], [0, 0.91, "obstacle"], [8, 0.84, "obstacle"],
+                 [17, 0.8, "obstacle"], [25, 0.76, "obstacle"], [33, 0.74, "obstacle"], [42, 0.73, "obstacle"]]
 
 
 class CyclingDockWatch(ebo_server.DockWatch):
@@ -1064,6 +1069,20 @@ class DockRecoveryTests(unittest.TestCase):
         self.assertEqual((side, info["basis"]), ("left", "far"))
         self.assertIsNone(ebo_server.dock_free_side(None)[0])
 
+    def test_side_decision_live_box_left_goes_right(self):
+        side, info = ebo_server.dock_free_side(LIVE_BOX_LEFT)
+        self.assertEqual((side, info["obstacle_side"], info["basis"]), ("right", "left", "nearest"))
+
+    def test_side_decision_wide_lateral_first(self):
+        # the closest wide-corridor point is 0.10 m to the LEFT -> go right, even if sectors say otherwise
+        side, info = ebo_server.dock_free_side(RIGHT_BLOCKED, wide_lateral=-0.10)
+        self.assertEqual((side, info["obstacle_side"], info["basis"]), ("right", "left", "wide_min"))
+        side, info = ebo_server.dock_free_side(LIVE_BOX_LEFT, wide_lateral=0.12)
+        self.assertEqual((side, info["basis"]), ("left", "wide_min"))
+        # a near-centre offset is not decisive -> fall back to the sectors
+        side, info = ebo_server.dock_free_side(LIVE_BOX_LEFT, wide_lateral=0.01)
+        self.assertEqual((side, info["basis"]), ("right", "nearest"))
+
     def test_left_blocked_sidesteps_right_and_relaunches(self):
         w = CyclingDockWatch(LEFT_BLOCKED)
         ev = self.run_until(w, ("recovering",))
@@ -1086,14 +1105,46 @@ class DockRecoveryTests(unittest.TestCase):
         self.assertLess(self.moves[0][1], 0)
         self.assertGreater(self.moves[2][1], 0)
 
-    def test_forward_refused_aborts(self):
+    def test_forward_refused_both_sides_aborts(self):
         self.forward_ok = False
         w = CyclingDockWatch(LEFT_BLOCKED)
         ev = self.run_until(w, ("recovery_aborted",))
         self.assertEqual(ev["kind"], "recovery_aborted", ev)
-        self.assertEqual(len(self.moves), 2)          # turn + refused forward, no turn back
+        r = round(ebo_server.DOCKWATCH_TURN_RX, 2)
+        # turn right, refused forward, 180 deg back to the left, refused forward, no turn back
+        self.assertEqual([m[:2] for m in self.moves], [(0.0, r), (0.6, 0.0), (0.0, -r), (0.6, 0.0)])
+        self.assertEqual(self.moves[2][2], round(2 * ebo_server.DOCKWATCH_TURN_S, 2))
         self.assertEqual(self.docks, [])
-        self.assertIn("sidestep forward was refused", w.take_notice())
+        n = w.take_notice()
+        self.assertIn("sidestep right refused", n)
+        self.assertIn("sidestep left refused too", n)
+
+    def test_first_side_refused_tries_other_side(self):
+        refused = [True]
+
+        def move(ly, rx, duration=0.4):
+            self.moves.append((round(ly, 2), round(rx, 2), round(duration, 2)))
+            if ly > 0 and refused[0]:
+                refused[0] = False
+                return {"ok": False, "stopped_by_guard": True, "phase": "start", "reason": "obstacle 0.10 m"}
+            return {"ok": True}
+        with mock.patch.object(ebo_server, "do_move", move):
+            w = CyclingDockWatch(LEFT_BLOCKED)
+            ev = self.run_until(w, ("recovering",))
+        self.assertEqual(ev["kind"], "recovering", ev)
+        r = round(ebo_server.DOCKWATCH_TURN_RX, 2)
+        # right, refused, 180 to the left, forward ok, turn back RIGHT (toward the original heading)
+        self.assertEqual([m[:2] for m in self.moves], [(0.0, r), (0.6, 0.0), (0.0, -r), (0.6, 0.0), (0.0, r)])
+        self.assertEqual(self.docks, ["dock"])
+        self.assertEqual(w.take_notice(), "docking blocked: obstacle 0.24 m on the left - sidestepped left "
+                                          "(right was blocked), retrying (1/2)")
+
+    def test_live_box_left_sidesteps_right(self):
+        w = CyclingDockWatch(LIVE_BOX_LEFT)
+        ev = self.run_until(w, ("recovering",))
+        self.assertEqual(ev["side"], "right", ev)
+        self.assertGreater(self.moves[0][1], 0)       # first turn is to the RIGHT
+        self.assertIn("on the left - sidestepped right", w.take_notice())
 
     def test_ambiguous_does_not_move(self):
         w = CyclingDockWatch(SYMMETRIC)

@@ -175,12 +175,15 @@ updates.
 
 ### Dock watch recovery (2026-10-02)
 After a dock-watch STOP (obstacle closing in the wide corridor) the bridge tries to help the firmware
-routine instead of just stopping: it picks the freer side from the depth sectors (`/depth/live`
-`"sectors"`, deg < 0 = left; nearest distance in |deg| <= `EBO_DOCKWATCH_NEAR_DEG` (25) differing by
->= `EBO_DOCKWATCH_SIDE_MIN_DIFF_M` (0.15), else the far sectors' mean; still unclear -> no movement,
-report), turns 90 deg toward it (`EBO_DOCKWATCH_TURN_RX` 0.6 for `EBO_DOCKWATCH_TURN_S` 1.0 s), drives
-`EBO_DOCKWATCH_SIDESTEP_M` (0.20 m at `EBO_DOCKWATCH_SIDESTEP_LY` 0.6 / `EBO_DOCKWATCH_SPEED_MPS` 0.14)
-through the normal forward depth guard (refused -> abort, "recovery_aborted"), turns back and relaunches
+routine instead of just stopping: it sidesteps AWAY from where the nearest obstacle is - the lateral
+offset of the closest wide-corridor point (`/depth/live` `"free_ahead_wide_lateral_m"`, + = right) when
+|offset| >= `EBO_DOCKWATCH_SIDE_LAT_MIN_M` (0.03), else the nearest sector per side over the full visible
+range (`"sectors"`, deg < 0 = left, +/-42 deg) differing by >= `EBO_DOCKWATCH_SIDE_MIN_DIFF_M` (0.15),
+else the mean per side; still unclear -> no movement, report. It turns 90 deg toward the free side
+(`EBO_DOCKWATCH_TURN_RX` 0.6 for `EBO_DOCKWATCH_TURN_S` 1.0 s), drives `EBO_DOCKWATCH_SIDESTEP_M`
+(0.20 m at `EBO_DOCKWATCH_SIDESTEP_LY` 0.6 / `EBO_DOCKWATCH_SPEED_MPS` 0.14) through the normal forward
+depth guard (refused -> turns 180 deg and tries the other side once; refused again -> "recovery_aborted"),
+turns back toward the original heading and relaunches
 the dock (pre-wake + a new watch). At most `EBO_DOCKWATCH_RECOVER_MAX` (2) retries, then "failed".
 `EBO_DOCKWATCH_RECOVER=0` = stop only (old behaviour).
 Pre-dock check: if the pre-wake reading's wide free distance is already < `EBO_DOCKWATCH_STOP_M`, the dock is not sent; the same sidestep runs first (counts as attempt 1) and then relaunches the dock; side unclear -> no move, "blocked before docking, side unclear". Skipped when docked (charge 1) or with recovery off. Events in `GET /dockwatch` (`kind`

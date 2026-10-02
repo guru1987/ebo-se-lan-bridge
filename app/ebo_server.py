@@ -1176,10 +1176,10 @@ DOCKWATCH_CONFIRM_S = float(os.environ.get("EBO_DOCKWATCH_CONFIRM_S", "3.0"))
 DOCKWATCH_WAKE_EVERY_S = 5.0
 # Recovery (Juraj 2026-10-02): after a STOP the obstacle is usually clearly on one side (the routine
 # already half-sees the dock). From the depth sectors (/depth/live "sectors" [deg (neg = left), m,
-# kind]) pick the freer side: nearest distance in the near sectors (|deg| <= EBO_DOCKWATCH_NEAR_DEG)
-# differs by >= EBO_DOCKWATCH_SIDE_MIN_DIFF_M, else the mean of the far sectors does; still unclear ->
-# don't move, report. Then turn 90 deg toward it (rx EBO_DOCKWATCH_TURN_RX for EBO_DOCKWATCH_TURN_S),
-# drive EBO_DOCKWATCH_SIDESTEP_M forward through the normal forward depth guard (refused / stopped ->
+# kind] + free_ahead_wide_lateral_m) pick the side AWAY from the nearest obstacle (see dock_free_side);
+# still unclear -> don't move, report. Then turn 90 deg toward it (rx EBO_DOCKWATCH_TURN_RX for
+# EBO_DOCKWATCH_TURN_S), drive EBO_DOCKWATCH_SIDESTEP_M forward through the normal forward depth guard
+# (refused -> turn 180 deg and try the other side once; refused again ->
 # abort), turn 90 deg back and relaunch the dock (pre-wake + a new watch). At most
 # EBO_DOCKWATCH_RECOVER_MAX retries, then "docking failed". EBO_DOCKWATCH_RECOVER=0 = stop only.
 DOCKWATCH_RECOVER = os.environ.get("EBO_DOCKWATCH_RECOVER", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -1190,7 +1190,11 @@ DOCKWATCH_SIDESTEP_M = float(os.environ.get("EBO_DOCKWATCH_SIDESTEP_M", "0.20"))
 DOCKWATCH_SIDESTEP_LY = float(os.environ.get("EBO_DOCKWATCH_SIDESTEP_LY", "0.6"))
 DOCKWATCH_SPEED_MPS = float(os.environ.get("EBO_DOCKWATCH_SPEED_MPS", "0.14"))
 DOCKWATCH_SIDE_MIN_DIFF_M = float(os.environ.get("EBO_DOCKWATCH_SIDE_MIN_DIFF_M", "0.15"))
-DOCKWATCH_NEAR_DEG = float(os.environ.get("EBO_DOCKWATCH_NEAR_DEG", "25"))
+# side = AWAY from where the nearest obstacle is: the lateral offset of the closest wide-corridor point
+# (depth free_ahead_wide_lateral_m, + = right) when |offset| >= this; else the nearest sector per side
+# over the full visible range (+/-42 deg), else the mean per side (2026-10-02: the old +/-25 deg window
+# missed a box at L42 and turned into it).
+DOCKWATCH_SIDE_LAT_MIN_M = float(os.environ.get("EBO_DOCKWATCH_SIDE_LAT_MIN_M", "0.03"))
 
 
 def dockwatch_config():
@@ -1201,7 +1205,7 @@ def dockwatch_config():
             "recover": {"enabled": DOCKWATCH_RECOVER, "max": DOCKWATCH_RECOVER_MAX, "turn_rx": DOCKWATCH_TURN_RX,
                         "turn_s": DOCKWATCH_TURN_S, "sidestep_m": DOCKWATCH_SIDESTEP_M,
                         "sidestep_ly": DOCKWATCH_SIDESTEP_LY, "speed_mps": DOCKWATCH_SPEED_MPS,
-                        "side_min_diff_m": DOCKWATCH_SIDE_MIN_DIFF_M, "near_deg": DOCKWATCH_NEAR_DEG}}
+                        "side_min_diff_m": DOCKWATCH_SIDE_MIN_DIFF_M, "side_lat_min_m": DOCKWATCH_SIDE_LAT_MIN_M}}
 
 
 def dock_approaching(values):
@@ -1214,10 +1218,12 @@ def dock_approaching(values):
             and v[0] - v[-1] >= DOCKWATCH_MIN_SHRINK_M)
 
 
-def dock_free_side(sectors):
-    """Pick the freer side from depth sectors [[deg, m, kind], ...] (deg < 0 = left).
-    Returns (side "left"|"right"|None, info)."""
-    def side_vals(sign, near):
+def dock_free_side(sectors, wide_lateral=None):
+    """Pick the side to sidestep to: AWAY from where the nearest obstacle actually is.
+    sectors [[deg, m, kind], ...] (deg < 0 = left), wide_lateral = lateral offset (m, + = right) of the
+    closest wide-corridor obstacle point (depth free_ahead_wide_lateral_m) or None.
+    Returns (side "left"|"right"|None, info incl. "obstacle_side")."""
+    def side_vals(sign):
         out = []
         for sec in sectors or []:
             try:
@@ -1226,18 +1232,30 @@ def dock_free_side(sectors):
                 continue
             if m is None or deg == 0 or (deg < 0) != (sign < 0):
                 continue
-            if (abs(deg) <= DOCKWATCH_NEAR_DEG) == near:
-                out.append(float(m))
+            out.append(float(m))
         return out
-    ln, rn = side_vals(-1, True), side_vals(1, True)
-    info = {"near_left_m": min(ln) if ln else None, "near_right_m": min(rn) if rn else None}
-    if ln and rn and abs(min(ln) - min(rn)) >= DOCKWATCH_SIDE_MIN_DIFF_M:
-        return ("left" if min(ln) > min(rn) else "right"), {**info, "basis": "near"}
-    lf, rf = side_vals(-1, False), side_vals(1, False)
-    info.update(far_left_m=round(sum(lf) / len(lf), 2) if lf else None,
-                far_right_m=round(sum(rf) / len(rf), 2) if rf else None)
-    if lf and rf and abs(info["far_left_m"] - info["far_right_m"]) >= DOCKWATCH_SIDE_MIN_DIFF_M:
-        return ("left" if info["far_left_m"] > info["far_right_m"] else "right"), {**info, "basis": "far"}
+
+    def away(obstacle, basis, extra):
+        return ("left" if obstacle == "right" else "right"), {**extra, "obstacle_side": obstacle, "basis": basis}
+
+    info = {}
+    if wide_lateral is not None:
+        try:
+            lat = float(wide_lateral)
+        except (TypeError, ValueError):
+            lat = None
+        if lat is not None:
+            info["obstacle_lateral_m"] = round(lat, 3)
+            if abs(lat) >= DOCKWATCH_SIDE_LAT_MIN_M:
+                return away("right" if lat > 0 else "left", "wide_min", info)
+    ls, rs = side_vals(-1), side_vals(1)
+    info.update(nearest_left_m=min(ls) if ls else None, nearest_right_m=min(rs) if rs else None)
+    if ls and rs and abs(min(ls) - min(rs)) >= DOCKWATCH_SIDE_MIN_DIFF_M:
+        return away("left" if min(ls) < min(rs) else "right", "nearest", info)
+    info.update(far_left_m=round(sum(ls) / len(ls), 2) if ls else None,
+                far_right_m=round(sum(rs) / len(rs), 2) if rs else None)
+    if ls and rs and abs(info["far_left_m"] - info["far_right_m"]) >= DOCKWATCH_SIDE_MIN_DIFF_M:
+        return away("left" if info["far_left_m"] < info["far_right_m"] else "right", "far", info)
     return None, {**info, "basis": "ambiguous"}
 
 
@@ -1289,7 +1307,8 @@ class DockWatch:
             free, kind, corridor = rd.get("free_ahead_m"), rd.get("free_ahead_kind"), "narrow (no wide corridor)"
         if free is None or float(free) >= DOCKWATCH_STOP_M:
             return None
-        return {"free_m": float(free), "kind": kind, "corridor": corridor, "sectors": rd.get("sectors")}
+        return {"free_m": float(free), "kind": kind, "corridor": corridor, "sectors": rd.get("sectors"),
+                "wide_lateral_m": rd.get("free_ahead_wide_lateral_m")}
 
     def start_blocked(self, prewake=None, pre=None, client="-"):
         """Blocked before docking: open a watch entry and run the sidestep recovery in the background
@@ -1303,7 +1322,8 @@ class DockWatch:
                             "history": [pre["free_m"]], "stopped": True, "prewake": prewake,
                             "attempt": attempt, "pre_dock_blocked": True}
         ev = {"kind": "stopped", "pre_dock": True, "free_m": pre["free_m"], "corridor": pre["corridor"],
-              "sectors": pre.get("sectors"), "stop_m": DOCKWATCH_STOP_M,
+              "sectors": pre.get("sectors"), "wide_lateral_m": pre.get("wide_lateral_m"),
+              "stop_m": DOCKWATCH_STOP_M,
               "message": f"blocked before docking: obstacle {pre['free_m']:.2f} m ahead"}
         print(f"[dockwatch] blocked before docking #{wid} (attempt {attempt}): {json.dumps(ev)}", flush=True)
 
@@ -1331,18 +1351,20 @@ class DockWatch:
             return (self.current or {}).get("attempt", 0) if self.watch_id == wid else 0
 
     def _recover(self, wid, stop_ev, attempt):
-        """After a confirmed STOP: sidestep toward the freer side and relaunch the dock."""
+        """After a confirmed STOP (or blocked before docking): sidestep AWAY from the obstacle and relaunch
+        the dock; if the sidestep forward is refused, turn 180 deg and try the other side once."""
         free = stop_ev.get("free_m")
-        sectors = stop_ev.get("sectors")
-        try:   # prefer a fresh reading's sectors (the robot has stopped)
+        sectors, lateral = stop_ev.get("sectors"), stop_ev.get("wide_lateral_m")
+        try:   # prefer a fresh reading (the robot has stopped)
             rd = self.fetch()
             if rd and rd.get("sectors") and time.time() - float(rd.get("frame_t") or 0) <= DOCKWATCH_STALE_S:
-                sectors = rd["sectors"]
+                sectors, lateral = rd["sectors"], rd.get("free_ahead_wide_lateral_m")
         except Exception:
             pass
-        side, sinfo = dock_free_side(sectors)
+        side, sinfo = dock_free_side(sectors, lateral)
         base = {**stop_ev, "side": side, "side_info": sinfo, "attempt": attempt + 1}
         pre_dock = bool(stop_ev.get("pre_dock"))
+        what = "blocked before docking" if pre_dock else "docking blocked"
         if side is None:
             if pre_dock:
                 msg = f"blocked before docking, side unclear: obstacle {free:.2f} m ahead - not moving"
@@ -1350,12 +1372,17 @@ class DockWatch:
                 msg = f"docking blocked: obstacle {free:.2f} m ahead, no clearly freer side - not moving"
             self._add_notice(msg)
             return self._end(wid, {**base, "kind": "stopped", "recovery": "ambiguous", "message": msg})
-        obstacle_side = "right" if side == "left" else "left"
+        obstacle_side = sinfo.get("obstacle_side") or ("right" if side == "left" else "left")
+        other = "right" if side == "left" else "left"
         rx = DOCKWATCH_TURN_RX if side == "right" else -DOCKWATCH_TURN_RX
         steps = []
+        fwd_s = DOCKWATCH_SIDESTEP_M / max(DOCKWATCH_SPEED_MPS, 0.01)
 
         def gone():
             return self.watch_id != wid
+
+        def docked():
+            return bridge.charge == 1
 
         print(f"[dockwatch] recover {attempt + 1}/{DOCKWATCH_RECOVER_MAX}: obstacle {free:.2f} m on the "
               f"{obstacle_side}, sidestep {side} {json.dumps(sinfo)}", flush=True)
@@ -1363,25 +1390,41 @@ class DockWatch:
         steps.append({"turn": side, "ok": r.get("ok")})
         if gone():
             return
-        if bridge.charge == 1:
+        if docked():
             return self._end(wid, {**base, "kind": "docked", "message": "docked (charging)", "steps": steps})
-        r = do_move(DOCKWATCH_SIDESTEP_LY, 0.0, DOCKWATCH_SIDESTEP_M / max(DOCKWATCH_SPEED_MPS, 0.01))
-        steps.append({"forward_m": DOCKWATCH_SIDESTEP_M, "ok": r.get("ok"), "reason": r.get("reason")})
+        r = do_move(DOCKWATCH_SIDESTEP_LY, 0.0, fwd_s)
+        steps.append({"forward_m": DOCKWATCH_SIDESTEP_M, "side": side, "ok": r.get("ok"), "reason": r.get("reason")})
+        went, back_rx = side, -rx
         if not r.get("ok"):
-            msg = (f"{'blocked before docking' if pre_dock else 'docking blocked'}: obstacle {free:.2f} m on "
-                   f"the {obstacle_side} - turned {side}, but the sidestep forward was refused "
-                   f"({r.get('reason') or 'guard'}); stopped")
-            self._add_notice(msg)
-            print(f"[dockwatch] recover aborted {json.dumps(steps)}", flush=True)
-            return self._end(wid, {**base, "kind": "recovery_aborted", "message": msg, "steps": steps})
+            first_reason = r.get("reason") or "guard"
+            if gone():
+                return
+            # the chosen side is blocked too: turn 180 deg and try the other side once
+            print(f"[dockwatch] sidestep {side} refused ({first_reason}) - turning 180 to try {other}", flush=True)
+            r = do_move(0.0, -rx, 2 * DOCKWATCH_TURN_S)
+            steps.append({"turn": other, "deg": 180, "ok": r.get("ok")})
+            if gone():
+                return
+            if docked():
+                return self._end(wid, {**base, "kind": "docked", "message": "docked (charging)", "steps": steps})
+            r = do_move(DOCKWATCH_SIDESTEP_LY, 0.0, fwd_s)
+            steps.append({"forward_m": DOCKWATCH_SIDESTEP_M, "side": other, "ok": r.get("ok"),
+                          "reason": r.get("reason")})
+            if not r.get("ok"):
+                msg = (f"{what}: obstacle {free:.2f} m on the {obstacle_side} - sidestep {side} refused "
+                       f"({first_reason}), sidestep {other} refused too ({r.get('reason') or 'guard'}); stopped")
+                self._add_notice(msg)
+                print(f"[dockwatch] recover aborted (both sides) {json.dumps(steps)}", flush=True)
+                return self._end(wid, {**base, "kind": "recovery_aborted", "message": msg, "steps": steps})
+            went, back_rx = other, rx
         if gone():
             return
-        r = do_move(0.0, -rx, DOCKWATCH_TURN_S)
-        steps.append({"turn_back": obstacle_side, "ok": r.get("ok")})
+        r = do_move(0.0, back_rx, DOCKWATCH_TURN_S)
+        steps.append({"turn_back": "right" if back_rx > 0 else "left", "ok": r.get("ok")})
         if gone():
             return
-        what = "blocked before docking" if pre_dock else "docking blocked"
-        msg = (f"{what}: obstacle {free:.2f} m on the {obstacle_side} - sidestepped {side}, "
+        msg = (f"{what}: obstacle {free:.2f} m on the {obstacle_side} - sidestepped {went}"
+               f"{'' if went == side else f' ({side} was blocked)'}, "
                f"{'docking' if pre_dock else 'retrying'} ({attempt + 1}/{DOCKWATCH_RECOVER_MAX})")
         self._add_notice(msg)
         self._end(wid, {**base, "kind": "recovering", "message": msg, "steps": steps})
@@ -1489,7 +1532,8 @@ class DockWatch:
                     msg = f"docking stopped: obstacle {free:.2f} m ahead"
                     ev = {"kind": "stopped", "message": msg, "free_m": free, "corridor": corridor,
                           "history": list(values), "stop_m": DOCKWATCH_STOP_M,
-                          "elapsed_s": round(now - t0, 1), "resends": 0, "sectors": rd.get("sectors")}
+                          "elapsed_s": round(now - t0, 1), "resends": 0, "sectors": rd.get("sectors"),
+                          "wide_lateral_m": rd.get("free_ahead_wide_lateral_m")}
                     self.last_event_stop = ev
                     with self.lock:
                         if self.watch_id == wid:
