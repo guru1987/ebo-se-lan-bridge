@@ -23,6 +23,28 @@ The API uses the same HTTP Basic authentication as the web panel.
 - `POST /photo` asks the robot IPC to save its original 1920x1080 frame under `/DICM`.
 - `GET /media` lists SD-card photos/videos; `GET /media/{name}` downloads an unambiguous basename.
 
+## Robot Skills (autonomous movement)
+
+`POST /action/big_circle` (aliases `/action/rotate` and `/action/donut`),
+`/action/straight_line` (aliases `/action/rush_forward` and `/action/rocket`),
+and `/action/swing` (alias `/action/shake`) invoke ROLA's three direct motion
+buttons (commands 40115,
+40116, and 40129). `/action/spin`, `/action/race`, `/action/excited`,
+`/action/relaxed`, and `/action/little_monster` invoke the five Robot Skills
+(commands 40164..40168). All use MAVLink message 200 (`COMMAND_MINI`). These
+actions can move or lift the robot abruptly; test on a blocked, level floor
+with clearance, direct supervision, and `/stop` ready. The firmware, not the
+bridge, controls each program's speed and duration.
+
+Trick gate: `POST /action/<trick>` is refused (`{"ok": false, "refused": true, "reason"}`,
+nothing sent) while the robot is charging/docked or its charge state is unknown, and,
+when the depth guard is on, unless one fresh depth reading shows `stop_free_m` of room
+ahead (a start-only check; the guard cannot stop a running firmware routine). `?force=1`
+skips both checks. Every trick call is logged as `[trick] SENT|REFUSED|FAILED {json}`.
+
+`GET /actions` lists every accepted action name; tricks carry `"moves": true` and their
+command number.
+
 Supported settings include speaker volume, call volume, drive speed, eye
 lights, night vision, obstacle/fall protection, fixed-point and cruise patrol,
 security notifications, sensitivity, notification interval, and the four

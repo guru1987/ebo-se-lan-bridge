@@ -37,6 +37,32 @@ class StateDecoderTests(unittest.TestCase):
         lx, ly, rx, ry = struct.unpack_from("<4f", frame.payload)
         self.assertEqual((lx, ly, rx, ry, frame.payload[16]), (0.0, -0.25, -0.5, 0.0, 0))
 
+    def test_special_motion_commands_match_rola_command_mini_payloads(self):
+        expected = {
+            "big_circle": 40115, "rotate": 40115, "donut": 40115,
+            "straight_line": 40116, "rush_forward": 40116, "rocket": 40116,
+            "swing": 40129, "shake": 40129,
+            "spin": 40164, "race": 40165, "excited": 40166,
+            "relaxed": 40167, "little_monster": 40168,
+        }
+        self.assertEqual(ebo_server.SPECIAL_MOTION_COMMANDS, expected)
+        for name, command in expected.items():
+            frame = MAVLinkV1Stream().feed(ebo_server.command_frame(command))[0]
+            self.assertEqual(frame.message_id, 200, name)
+            self.assertEqual(frame.payload, struct.pack("<HBB", command, 255, 1), name)
+
+    def test_special_motion_action_sends_one_frame(self):
+        fake_bridge = mock.Mock()
+        with mock.patch.object(ebo_server, "bridge", fake_bridge):
+            self.assertTrue(ebo_server.do_action("spin"))
+        fake_bridge.send_rdt.assert_called_once_with(ebo_server.command_frame(40164))
+
+    def test_unknown_special_motion_is_not_sent(self):
+        fake_bridge = mock.Mock()
+        with mock.patch.object(ebo_server, "bridge", fake_bridge):
+            self.assertFalse(ebo_server.do_action("backflip"))
+        fake_bridge.send_rdt.assert_not_called()
+
     def test_fragmented_parameter_echo_updates_state_and_callback(self):
         bridge = state_bridge()
         changes = []
@@ -140,6 +166,83 @@ class ControlAPITests(unittest.TestCase):
             response = client.put("/parameter/audio/volume", json={"value": 44})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["acknowledged"])
+
+
+class TrickGateTests(unittest.TestCase):
+    """GET /actions and the charging/depth gate on POST /action/<trick>; nothing real is sent."""
+
+    def client(self, charge, guard=None):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        self.fake = mock.Mock()
+        self.fake.charge, self.fake.battery = charge, 80
+        patches = [mock.patch.object(ebo_server, "bridge", self.fake),
+                   mock.patch.object(ebo_server, "guard", guard),
+                   mock.patch.object(ebo_server, "WEB_USER", None)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        try:
+            return TestClient(ebo_server.app)
+        except TypeError as exc:
+            self.skipTest(f"incompatible TestClient: {exc}")
+
+    def test_actions_lists_toggles_and_tricks(self):
+        r = self.client(1).get("/actions")
+        self.assertEqual(r.status_code, 200)
+        acts = {a["name"]: a for a in r.json()["actions"]}
+        for n in ("dock", "undock", "eyes_on", "sleep", "wake", "autoreturn_on"):
+            self.assertFalse(acts[n]["moves"], n)
+        for n, c in ebo_server.SPECIAL_MOTION_COMMANDS.items():
+            self.assertTrue(acts[n]["moves"], n)
+            self.assertEqual(acts[n]["command"], c)
+        self.assertEqual(set(acts), set(ebo_server.BASIC_ACTIONS) | set(ebo_server.PARAM_TOGGLES)
+                         | set(ebo_server.SPECIAL_MOTION_COMMANDS))
+        self.fake.send_rdt.assert_not_called()
+
+    def test_trick_refused_while_charging(self):
+        r = self.client(1).post("/action/donut").json()
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["refused"])
+        self.assertIn("charging", r["reason"])
+        self.fake.send_rdt.assert_not_called()
+
+    def test_trick_refused_when_charge_unknown(self):
+        r = self.client(-1).post("/action/spin").json()
+        self.assertTrue(r["refused"])
+        self.fake.send_rdt.assert_not_called()
+
+    def test_trick_force_sends_exactly_one_frame(self):
+        r = self.client(1).post("/action/rocket?force=1").json()
+        self.assertTrue(r["ok"])
+        self.fake.send_rdt.assert_called_once_with(ebo_server.command_frame(40116))
+
+    def test_trick_unplugged_without_guard_sends_one_frame(self):
+        r = self.client(0).post("/action/little_monster").json()
+        self.assertTrue(r["ok"])
+        self.fake.send_rdt.assert_called_once_with(ebo_server.command_frame(40168))
+
+    def test_trick_refused_by_depth_guard(self):
+        g = mock.Mock()
+        g.wait_ready.return_value = (False, {"reason": "too close", "free_ahead_m": 0.1})
+        r = self.client(0, guard=g).post("/action/swing").json()
+        self.assertTrue(r["refused"])
+        self.assertIn("depth guard", r["reason"])
+        self.fake.send_rdt.assert_not_called()
+
+    def test_trick_allowed_by_depth_guard(self):
+        g = mock.Mock()
+        g.wait_ready.return_value = (True, {"free_ahead_m": 1.0})
+        r = self.client(0, guard=g).post("/action/race").json()
+        self.assertTrue(r["ok"])
+        self.fake.send_rdt.assert_called_once_with(ebo_server.command_frame(40165))
+
+    def test_unknown_action_still_unknown(self):
+        r = self.client(0).post("/action/backflip").json()
+        self.assertEqual(r, {"ok": False, "err": "unknown"})
+        self.fake.send_rdt.assert_not_called()
 
 
 class VideoAndAudioPublicationTests(unittest.TestCase):

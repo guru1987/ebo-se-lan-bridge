@@ -109,6 +109,18 @@ def command_frame(command):
     return _frame(200, struct.pack('<H', command) + bytes([255, 1]), 196)
 
 CMD_DOCK = 40154
+# ROLA: direct live controls plus SEDeviceInfoFragment -> AirAutoFragment ->
+# LiveViewModel.r(). These are firmware-owned, self-terminating motions. Keep
+# the public names explicit: accepting arbitrary command IDs here would bypass
+# the API's movement safety boundary. "rocket" is the familiar name for
+# ROLA's "Rush Forward" control; both names map to the same command.
+SPECIAL_MOTION_COMMANDS = {
+    "big_circle": 40115, "rotate": 40115, "donut": 40115,
+    "straight_line": 40116, "rush_forward": 40116, "rocket": 40116,
+    "swing": 40129, "shake": 40129,
+    "spin": 40164, "race": 40165, "excited": 40166,
+    "relaxed": 40167, "little_monster": 40168,
+}
 MAVLINK = FrameBuilder()
 
 # Device info (captured; for a community release these would be queried at runtime via MAVLink)
@@ -723,6 +735,9 @@ class Bridge:
 def do_action(name: str) -> bool:
     if name == "dock":
         for _ in range(5): bridge.send_rdt(command_frame(CMD_DOCK)); time.sleep(0.15)
+    elif name in SPECIAL_MOTION_COMMANDS:
+        # ROLA sends exactly one COMMAND_MINI frame for a selected motion.
+        bridge.send_rdt(command_frame(SPECIAL_MOTION_COMMANDS[name]))
     elif name == "undock":
         for _ in range(6): bridge.send_rdt(motor_frame(ly=0.5)); time.sleep(0.05)
         bridge.send_rdt(motor_frame())
@@ -1318,8 +1333,63 @@ def stop():
     for _ in range(3): bridge.send_rdt(motor_frame()); time.sleep(0.02)
     return {"ok": True}
 
+BASIC_ACTIONS = ("dock", "undock", "autoreturn_off", "autoreturn_on")
+
+
+def action_catalog():
+    """Every name POST /action/{name} accepts; tricks (firmware motion routines) carry moves=True."""
+    out = [{"name": n, "moves": False} for n in BASIC_ACTIONS + tuple(PARAM_TOGGLES)]
+    out += [{"name": n, "moves": True, "trick": True, "command": c}
+            for n, c in SPECIAL_MOTION_COMMANDS.items()]
+    return out
+
+
+@app.get("/actions")
+def actions():
+    return {"actions": action_catalog()}
+
+
+def trick_refusal(force: bool):
+    """Why a trick must not start now (None = allowed). Tricks are firmware routines that run on
+    their own once sent (the bridge cannot meter or reliably stop them), so they are gated at the
+    start: refused while the robot is charging/docked or its charge state is unknown, and - when the
+    depth guard is on - unless one fresh depth reading shows room ahead. force=True skips both."""
+    if force:
+        return None
+    charge = bridge.charge if bridge else -1
+    if charge != 0:
+        return {"reason": "robot is charging/docked" if charge == 1 else f"charge state not unplugged ({charge})",
+                "charge": charge}
+    if guard is not None:
+        ok, info = guard.wait_ready(GUARD_START_WAIT_S)
+        if not ok:
+            return {**{k: v for k, v in info.items() if k != "reason"},
+                    "reason": f"depth guard: {info.get('reason')}"}
+    return None
+
+
+def do_trick(name: str, force: bool = False, client: str = "-"):
+    """Gate, log and send one trick. Every call is logged ([trick] SENT / REFUSED / FAILED)."""
+    base = {"action": name, "command": SPECIAL_MOTION_COMMANDS[name], "force": force,
+            "charge": bridge.charge if bridge else -1, "battery": bridge.battery if bridge else -1,
+            "client": client}
+    refusal = trick_refusal(force)
+    if refusal is not None:
+        print(f"[trick] REFUSED {json.dumps({**base, **refusal})}", flush=True)
+        return {"ok": False, "refused": True, "action": name, **refusal}
+    try:
+        do_action(name)
+    except Exception as exc:
+        print(f"[trick] FAILED {json.dumps({**base, 'error': type(exc).__name__})}", flush=True)
+        return {"ok": False, "action": name, "err": type(exc).__name__}
+    print(f"[trick] SENT {json.dumps(base)}", flush=True)
+    return {"ok": True, "action": name, "trick": True, "force": force}
+
+
 @app.post("/action/{name}")
-def action(name: str):
+def action(name: str, request: Request, force: int = 0):
+    if name in SPECIAL_MOTION_COMMANDS:
+        return do_trick(name, bool(force), request.client.host if request.client else "-")
     return {"ok": True, "action": name} if do_action(name) else {"ok": False, "err": "unknown"}
 
 @app.post("/connection/{state}")
