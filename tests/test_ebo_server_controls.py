@@ -245,6 +245,81 @@ class TrickGateTests(unittest.TestCase):
         self.fake.send_rdt.assert_not_called()
 
 
+class DockGuardRailTests(unittest.TestCase):
+    """While on the dock only a straight forward /move or /drive is allowed; nothing real is sent."""
+
+    def client(self, charge):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        self.fake = mock.Mock()
+        self.fake.charge, self.fake.battery = charge, 80
+        patches = [mock.patch.object(ebo_server, "bridge", self.fake),
+                   mock.patch.object(ebo_server, "guard", None),
+                   mock.patch.object(ebo_server, "WEB_USER", None),
+                   mock.patch.object(ebo_server.time, "sleep", lambda _s: None)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        ebo_server._dock_log_last.clear()
+        try:
+            return TestClient(ebo_server.app)
+        except TypeError as exc:
+            self.skipTest(f"incompatible TestClient: {exc}")
+
+    def refused(self, c, path, ly, rx):
+        r = c.post(path, json={"ly": ly, "rx": rx, "duration": 0.2}).json()
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["refused"])
+        self.assertTrue(r["dock_guard"])
+        self.assertIn("on the dock: only straight forward allowed — drive off first", r["reason"].replace(
+            "charge state unknown, assuming on the dock", "on the dock"))
+        self.fake.send_rdt.assert_not_called()
+        return r
+
+    def test_docked_refuses_turn_and_back_on_move_and_drive(self):
+        c = self.client(1)
+        for path in ("/move", "/drive"):
+            for ly, rx in ((0, 0.5), (0, -0.5), (0.5, 0.3), (0.5, -0.3), (-0.5, 0), (-0.5, 0.4)):
+                self.refused(c, path, ly, rx)
+
+    def test_docked_refusal_is_logged(self):
+        c = self.client(1)
+        with mock.patch("builtins.print") as pr:
+            self.refused(c, "/move", -0.5, 0)
+        self.assertTrue(any("[dock] REFUSED" in str(a[0][0]) for a in pr.call_args_list))
+
+    def test_docked_straight_forward_is_allowed(self):
+        c = self.client(1)
+        self.assertTrue(c.post("/move", json={"ly": 0.5, "rx": 0, "duration": 0.2}).json()["ok"])
+        sent = [call.args[0] for call in self.fake.send_rdt.call_args_list]
+        self.assertIn(ebo_server.motor_frame(ly=0.5, rx=0.0), sent)
+        self.fake.send_rdt.reset_mock()
+        self.assertTrue(c.post("/drive", json={"ly": 0.5, "rx": 0}).json()["ok"])
+        self.fake.send_rdt.assert_called_once_with(ebo_server.motor_frame(ly=0.5, rx=0.0))
+
+    def test_unknown_charge_refuses_turn_and_back_allows_forward(self):
+        c = self.client(-1)
+        r = self.refused(c, "/move", 0, 0.5)
+        self.assertEqual(r["charge"], -1)
+        self.refused(c, "/drive", -0.5, 0)
+        self.assertTrue(c.post("/drive", json={"ly": 0.5, "rx": 0}).json()["ok"])
+
+    def test_unplugged_allows_everything(self):
+        c = self.client(0)
+        for path in ("/move", "/drive"):
+            for ly, rx in ((0, 0.5), (-0.5, 0), (0.5, 0.3)):
+                self.fake.send_rdt.reset_mock()
+                self.assertTrue(c.post(path, json={"ly": ly, "rx": rx, "duration": 0.2}).json()["ok"])
+                self.fake.send_rdt.assert_called()
+
+    def test_dock_and_undock_actions_unchanged(self):
+        c = self.client(1)
+        self.assertEqual(c.post("/action/undock").json(), {"ok": True, "action": "undock"})
+        self.assertEqual(c.post("/action/dock").json(), {"ok": True, "action": "dock"})
+
+
 class VideoAndAudioPublicationTests(unittest.TestCase):
     def video_bridge(self):
         bridge = ebo_server.Bridge.__new__(ebo_server.Bridge)

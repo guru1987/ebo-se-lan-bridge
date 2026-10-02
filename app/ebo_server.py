@@ -880,6 +880,30 @@ class DepthGuard:
 guard = None
 
 
+# ---- dock guard rail: while on the charging dock only a straight forward move (drives it off) ----
+DOCK_REASON = "on the dock: only straight forward allowed — drive off first"
+_dock_log_last = {}
+
+
+def dock_refusal(ly: float, rx: float, client: str = "-", via: str = "move"):
+    """None = allowed. While the robot is charging/docked (charge == 1) or its charge state is
+    unknown/odd (anything but 0 = unplugged), only a straight FORWARD move (ly > 0 and rx == 0) is
+    allowed; any turn or backwards move is refused. A pure stop (ly == 0 and rx == 0) is always fine.
+    Undock/dock actions are not moves and are unaffected. No motor frame is sent on refusal."""
+    charge = bridge.charge if bridge else -1
+    if charge == 0 or (ly == 0 and rx == 0) or (ly > 0 and rx == 0):
+        return None
+    why = DOCK_REASON if charge == 1 else DOCK_REASON.replace("on the dock", "charge state unknown, assuming on the dock")
+    info = {"ok": False, "refused": True, "refused_by": "dock", "dock_guard": True,
+            "reason": why, "charge": charge, "ly": ly, "rx": rx}
+    key = (via, charge, ly > 0, ly < 0, rx != 0)
+    now = time.monotonic()
+    if now - _dock_log_last.get(key, -1e9) >= 1.0:   # /drive posts at ~15 Hz: log once a second per kind
+        _dock_log_last[key] = now
+        print(f"[dock] REFUSED {via} {json.dumps({**info, 'client': client})}", flush=True)
+    return info
+
+
 def _guard_result(info, phase, moved_s=0.0):
     out = {"ok": False, "stopped_by_guard": True, "phase": phase, "moved_s": round(moved_s, 2)}
     out.update({k: v for k, v in info.items() if k not in ("move_id", "logged")})
@@ -1287,7 +1311,10 @@ class Move(BaseModel):
     duration: float = Field(default=0.4, gt=0.0, le=2.0)
 
 @app.post("/move")
-def move(m: Move):
+def move(m: Move, request: Request):
+    refusal = dock_refusal(m.ly, m.rx, request.client.host if request.client else "-", "move")
+    if refusal is not None:
+        return refusal
     return do_move(m.ly, m.rx, m.duration)
 
 # Analog joystick: the panel POSTs the current vector at ~15 Hz while dragging. Each call
@@ -1296,8 +1323,11 @@ def move(m: Move):
 _last_drive = 0.0
 
 @app.post("/drive")
-def drive(m: Move):
+def drive(m: Move, request: Request):
     global _last_drive
+    refusal = dock_refusal(m.ly, m.rx, request.client.host if request.client else "-", "drive")
+    if refusal is not None:
+        return refusal
     if guard is not None and m.ly > 0:
         # forward: only on a fresh good depth verdict; the guard thread stops it mid-way
         t_call = time.monotonic()
