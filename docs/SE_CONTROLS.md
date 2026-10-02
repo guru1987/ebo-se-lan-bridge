@@ -182,7 +182,8 @@ report), turns 90 deg toward it (`EBO_DOCKWATCH_TURN_RX` 0.6 for `EBO_DOCKWATCH_
 `EBO_DOCKWATCH_SIDESTEP_M` (0.20 m at `EBO_DOCKWATCH_SIDESTEP_LY` 0.6 / `EBO_DOCKWATCH_SPEED_MPS` 0.14)
 through the normal forward depth guard (refused -> abort, "recovery_aborted"), turns back and relaunches
 the dock (pre-wake + a new watch). At most `EBO_DOCKWATCH_RECOVER_MAX` (2) retries, then "failed".
-`EBO_DOCKWATCH_RECOVER=0` = stop only (old behaviour). Events in `GET /dockwatch` (`kind`
+`EBO_DOCKWATCH_RECOVER=0` = stop only (old behaviour).
+Pre-dock check: if the pre-wake reading's wide free distance is already < `EBO_DOCKWATCH_STOP_M`, the dock is not sent; the same sidestep runs first (counts as attempt 1) and then relaunches the dock; side unclear -> no move, "blocked before docking, side unclear". Skipped when docked (charge 1) or with recovery off. Events in `GET /dockwatch` (`kind`
 recovering / recovery_aborted / failed, `side`, `side_info`, `steps`, `attempt`); messages for the
 brother accumulate in the one-time `dockwatch_notice`, e.g. "docking blocked: obstacle 0.20 m on the
 left - sidestepped right, retrying (1/2)" / "docking failed after 2 attempts: obstacle 0.24 m ahead".

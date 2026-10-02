@@ -1105,6 +1105,7 @@ class DockRecoveryTests(unittest.TestCase):
 
     def test_max_attempts_then_failed(self):
         w = CyclingDockWatch(LEFT_BLOCKED)
+        w.pre_check = lambda: None   # this test covers the after-STOP path only
         ev = self.run_until(w, ("failed",), relaunch=True, timeout=8.0)
         self.assertEqual(ev["kind"], "failed", ev)
         self.assertEqual(ev["attempt"], 2)
@@ -1130,3 +1131,128 @@ class DockRecoveryTests(unittest.TestCase):
         w.start()
         self.assertEqual(w.status()["watch"]["attempt"], 0)
         w.watch_id += 1   # supersede the thread
+
+
+class FixedDockWatch(ebo_server.DockWatch):
+    """Every poll a fresh reading with a constant wide free distance."""
+
+    def __init__(self, free, sectors):
+        super().__init__("http://127.0.0.1:9/none", None, None)
+        self.free, self.sectors, self.i = free, sectors, 0
+
+    def fetch(self):
+        self.i += 1
+        return {"seq": self.i, "frame_t": time.time(), "free_ahead_m": self.free, "free_ahead_kind": "obstacle",
+                "free_ahead_wide_m": self.free, "free_ahead_wide_kind": "obstacle", "wide_half_width_m": 0.17,
+                "sectors": self.sectors}
+
+
+class PreDockBlockedTests(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeVideoBridge(charge=0, video=True)
+        self.moves = []
+
+        def fake_move(ly, rx, duration=0.4):
+            self.moves.append((round(ly, 2), round(rx, 2), round(duration, 2)))
+            return {"ok": True}
+        for p in (mock.patch.object(ebo_server, "bridge", self.fake),
+                  mock.patch.object(ebo_server, "guard", None),
+                  mock.patch.object(ebo_server, "do_move", fake_move),
+                  mock.patch.object(ebo_server, "DOCKWATCH_POLL_S", 0.005),
+                  mock.patch.object(ebo_server, "DOCKWATCH_CONFIRM_S", 0.1),
+                  mock.patch.object(ebo_server, "DOCKWATCH_TIMEOUT_S", 0.5),
+                  mock.patch.object(ebo_server, "DOCKWATCH_RECOVER", True),
+                  mock.patch.object(ebo_server, "DOCKWATCH_RECOVER_MAX", 2),
+                  mock.patch.object(ebo_server, "DOCK_PREWAKE_S", 0),
+                  mock.patch.object(ebo_server, "GUARD_VIDEO_KEEP_URL", ""),
+                  mock.patch.object(ebo_server, "WEB_USER", None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def docks_sent(self):
+        return self.fake.count(ebo_server.command_frame(ebo_server.CMD_DOCK))
+
+    def wait_event(self, w, kinds, timeout=3.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            ev = w.status()["last_event"]
+            if ev and ev.get("kind") in kinds:
+                return ev
+            time.sleep(0.01)
+        return w.status()["last_event"]
+
+    def test_blocked_left_sidesteps_right_then_docks(self):
+        w = FixedDockWatch(0.12, LEFT_BLOCKED)
+        calls = []
+        real = ebo_server.do_action
+
+        def relaunch(name):   # the recovery's relaunch: obstacle gone, dock for real
+            calls.append(name)
+            w.free = 1.0
+            return real(name)
+        with mock.patch.object(ebo_server, "dockwatch", w), \
+             mock.patch.object(ebo_server, "do_action", relaunch):
+            self.assertTrue(real("dock"))
+            t0 = time.monotonic()
+            while not (calls and w.status()["active"]) and time.monotonic() - t0 < 3:
+                time.sleep(0.01)                                     # relaunch done: its watch runs
+            ev = w.status()["last_event"]
+            w.watch_id += 1   # supersede the relaunched watch
+        # the blocked dock itself sent no CMD_DOCK: only the relaunch's 5 frames
+        self.assertEqual(ev["kind"], "recovering", ev)
+        self.assertTrue(ev.get("pre_dock"))
+        self.assertEqual(ev["side"], "right")
+        r = ebo_server.DOCKWATCH_TURN_RX
+        self.assertEqual([m[:2] for m in self.moves], [(0.0, round(r, 2)), (0.6, 0.0), (0.0, round(-r, 2))])
+        self.assertEqual(calls, ["dock"])
+        self.assertEqual(self.docks_sent(), 5)                       # the relaunch sent the dock
+        self.assertEqual(w.take_notice(),
+                         "blocked before docking: obstacle 0.12 m on the left - sidestepped right, docking (1/2)")
+
+    def test_blocked_ambiguous_does_not_move_or_dock(self):
+        w = FixedDockWatch(0.12, SYMMETRIC)
+        with mock.patch.object(ebo_server, "dockwatch", w):
+            ebo_server.do_action("dock")
+            ev = self.wait_event(w, ("stopped",))
+        self.assertEqual(ev.get("recovery"), "ambiguous", ev)
+        self.assertEqual(self.moves, [])
+        self.assertEqual(self.docks_sent(), 0)
+        self.assertEqual(w.take_notice(), "blocked before docking, side unclear: obstacle 0.12 m ahead - not moving")
+
+    def test_not_blocked_docks_normally(self):
+        w = FixedDockWatch(0.6, LEFT_BLOCKED)
+        with mock.patch.object(ebo_server, "dockwatch", w):
+            ebo_server.do_action("dock")
+            self.assertEqual(self.docks_sent(), 5)
+            self.assertFalse(w.status()["watch"].get("pre_dock_blocked", False))
+            w.watch_id += 1   # supersede the watch thread
+
+    def test_docked_skips_check(self):
+        self.fake.charge = 1
+        w = FixedDockWatch(0.12, LEFT_BLOCKED)
+        with mock.patch.object(ebo_server, "dockwatch", w):
+            ebo_server.do_action("dock")
+            w.watch_id += 1
+        self.assertEqual(self.docks_sent(), 5)
+        self.assertEqual(self.moves, [])
+
+    def test_recovery_off_docks_normally(self):
+        w = FixedDockWatch(0.12, LEFT_BLOCKED)
+        with mock.patch.object(ebo_server, "DOCKWATCH_RECOVER", False), \
+             mock.patch.object(ebo_server, "dockwatch", w):
+            ebo_server.do_action("dock")
+            self.assertEqual(self.docks_sent(), 5)
+            w.watch_id += 1
+        self.assertEqual(self.moves, [])
+
+    def test_blocked_at_max_attempts_fails_without_moving(self):
+        w = FixedDockWatch(0.12, LEFT_BLOCKED)
+        w.next_attempt = 2
+        with mock.patch.object(ebo_server, "dockwatch", w):
+            ebo_server.do_action("dock")
+            ev = self.wait_event(w, ("failed",))
+        self.assertEqual(ev["kind"], "failed", ev)
+        self.assertEqual(self.moves, [])
+        self.assertEqual(self.docks_sent(), 0)
+        self.assertEqual(w.take_notice(),
+                         "docking failed after 2 attempts: blocked before docking, obstacle 0.12 m ahead")

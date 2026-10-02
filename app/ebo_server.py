@@ -750,6 +750,14 @@ def do_action(name: str) -> bool:
                 _last_dock_prewake = guard.wait_reading(DOCK_PREWAKE_S)
             except Exception as e:   # never block docking on the pre-wake
                 _last_dock_prewake = {"error": type(e).__name__}
+        # pre-dock check: already blocked before the routine starts (wide free < stop distance)?
+        # Then sidestep first (same recovery as after a STOP, counts as an attempt) instead of
+        # letting the firmware drive straight into it.
+        if dockwatch is not None and DOCKWATCH_RECOVER and bridge.charge != 1:
+            pre = dockwatch.pre_check()
+            if pre is not None:
+                dockwatch.start_blocked(prewake=_last_dock_prewake, pre=pre)
+                return True
         for _ in range(5): bridge.send_rdt(command_frame(CMD_DOCK)); time.sleep(0.15)
         if dockwatch is not None:
             dockwatch.start(prewake=_last_dock_prewake)
@@ -1264,6 +1272,51 @@ class DockWatch:
         threading.Thread(target=self._run, args=(wid,), name="dockwatch", daemon=True).start()
         return {"watching": True, "watch_id": wid, "stop_m": DOCKWATCH_STOP_M, "timeout_s": DOCKWATCH_TIMEOUT_S}
 
+    def pre_check(self):
+        """Before CMD_DOCK: a fresh reading whose WIDE free distance is already < DOCKWATCH_STOP_M
+        -> {"free_m", "corridor", "sectors", "kind"}; otherwise None (dock normally)."""
+        try:
+            rd = self.fetch()
+        except Exception:
+            return None
+        if not rd or time.time() - float(rd.get("frame_t") or 0) > DOCKWATCH_STALE_S:
+            return None
+        if "free_ahead_wide_m" in rd:
+            free, kind, corridor = rd.get("free_ahead_wide_m"), rd.get("free_ahead_wide_kind"), "wide"
+            if rd.get("wide_half_width_m") is not None:
+                corridor = f"wide +/-{rd['wide_half_width_m']:.2f} m"
+        else:
+            free, kind, corridor = rd.get("free_ahead_m"), rd.get("free_ahead_kind"), "narrow (no wide corridor)"
+        if free is None or float(free) >= DOCKWATCH_STOP_M:
+            return None
+        return {"free_m": float(free), "kind": kind, "corridor": corridor, "sectors": rd.get("sectors")}
+
+    def start_blocked(self, prewake=None, pre=None, client="-"):
+        """Blocked before docking: open a watch entry and run the sidestep recovery in the background
+        (it relaunches the dock itself); counts as a recovery attempt."""
+        with self.lock:
+            self.watch_id += 1
+            wid = self.watch_id
+            attempt, self.next_attempt = self.next_attempt, 0
+            self.current = {"watch_id": wid, "started": time.time(), "client": client, "readings": 1,
+                            "blind": 0, "unscaled": 0, "last_free_m": pre["free_m"], "corridor": pre["corridor"],
+                            "history": [pre["free_m"]], "stopped": True, "prewake": prewake,
+                            "attempt": attempt, "pre_dock_blocked": True}
+        ev = {"kind": "stopped", "pre_dock": True, "free_m": pre["free_m"], "corridor": pre["corridor"],
+              "sectors": pre.get("sectors"), "stop_m": DOCKWATCH_STOP_M,
+              "message": f"blocked before docking: obstacle {pre['free_m']:.2f} m ahead"}
+        print(f"[dockwatch] blocked before docking #{wid} (attempt {attempt}): {json.dumps(ev)}", flush=True)
+
+        def run():
+            if attempt >= DOCKWATCH_RECOVER_MAX:
+                msg = (f"docking failed after {DOCKWATCH_RECOVER_MAX} attempts: blocked before docking, "
+                       f"obstacle {pre['free_m']:.2f} m ahead")
+                self._add_notice(msg)
+                return self._end(wid, {**ev, "kind": "failed", "message": msg, "attempt": attempt})
+            self._recover(wid, ev, attempt)
+        threading.Thread(target=run, name="dockwatch-pre", daemon=True).start()
+        return {"watching": True, "watch_id": wid, "pre_dock_blocked": True}
+
     def take_notice(self):
         with self.lock:
             n, self.notice = self.notice, None
@@ -1289,8 +1342,12 @@ class DockWatch:
             pass
         side, sinfo = dock_free_side(sectors)
         base = {**stop_ev, "side": side, "side_info": sinfo, "attempt": attempt + 1}
+        pre_dock = bool(stop_ev.get("pre_dock"))
         if side is None:
-            msg = f"docking blocked: obstacle {free:.2f} m ahead, no clearly freer side - not moving"
+            if pre_dock:
+                msg = f"blocked before docking, side unclear: obstacle {free:.2f} m ahead - not moving"
+            else:
+                msg = f"docking blocked: obstacle {free:.2f} m ahead, no clearly freer side - not moving"
             self._add_notice(msg)
             return self._end(wid, {**base, "kind": "stopped", "recovery": "ambiguous", "message": msg})
         obstacle_side = "right" if side == "left" else "left"
@@ -1311,8 +1368,9 @@ class DockWatch:
         r = do_move(DOCKWATCH_SIDESTEP_LY, 0.0, DOCKWATCH_SIDESTEP_M / max(DOCKWATCH_SPEED_MPS, 0.01))
         steps.append({"forward_m": DOCKWATCH_SIDESTEP_M, "ok": r.get("ok"), "reason": r.get("reason")})
         if not r.get("ok"):
-            msg = (f"docking blocked: obstacle {free:.2f} m on the {obstacle_side} - turned {side}, but the "
-                   f"sidestep forward was refused ({r.get('reason') or 'guard'}); stopped")
+            msg = (f"{'blocked before docking' if pre_dock else 'docking blocked'}: obstacle {free:.2f} m on "
+                   f"the {obstacle_side} - turned {side}, but the sidestep forward was refused "
+                   f"({r.get('reason') or 'guard'}); stopped")
             self._add_notice(msg)
             print(f"[dockwatch] recover aborted {json.dumps(steps)}", flush=True)
             return self._end(wid, {**base, "kind": "recovery_aborted", "message": msg, "steps": steps})
@@ -1322,8 +1380,9 @@ class DockWatch:
         steps.append({"turn_back": obstacle_side, "ok": r.get("ok")})
         if gone():
             return
-        msg = (f"docking blocked: obstacle {free:.2f} m on the {obstacle_side} - sidestepped {side}, "
-               f"retrying ({attempt + 1}/{DOCKWATCH_RECOVER_MAX})")
+        what = "blocked before docking" if pre_dock else "docking blocked"
+        msg = (f"{what}: obstacle {free:.2f} m on the {obstacle_side} - sidestepped {side}, "
+               f"{'docking' if pre_dock else 'retrying'} ({attempt + 1}/{DOCKWATCH_RECOVER_MAX})")
         self._add_notice(msg)
         self._end(wid, {**base, "kind": "recovering", "message": msg, "steps": steps})
         with self.lock:
@@ -1980,6 +2039,8 @@ def action(name: str, request: Request, force: int = 0):
             w = dockwatch.status()["watch"] or {}
             out["dockwatch"] = {"watching": True, "watch_id": w.get("watch_id"), "stop_m": DOCKWATCH_STOP_M,
                                 "timeout_s": DOCKWATCH_TIMEOUT_S}
+            if w.get("pre_dock_blocked"):
+                out["dockwatch"]["pre_dock_blocked"] = True
         else:
             out["dockwatch"] = {"watching": False}
         if _last_dock_prewake is not None:
