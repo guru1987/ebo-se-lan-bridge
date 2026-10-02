@@ -731,6 +731,7 @@ class DockWatchTests(unittest.TestCase):
                   mock.patch.object(ebo_server, "DOCKWATCH_POLL_S", 0.005),
                   mock.patch.object(ebo_server, "DOCKWATCH_CONFIRM_S", 0.15),
                   mock.patch.object(ebo_server, "DOCKWATCH_TIMEOUT_S", 2.0),
+                  mock.patch.object(ebo_server, "DOCKWATCH_RECOVER", False),
                   mock.patch.object(ebo_server, "GUARD_VIDEO_KEEP_URL", ""),
                   mock.patch.object(ebo_server, "WEB_USER", None)):
             p.start()
@@ -982,3 +983,150 @@ class DockPrewakeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LEFT_BLOCKED = [[-42, 1.5, "far"], [-34, 1.2, "clear"], [-25, 0.3, "obstacle"], [-17, 0.25, "obstacle"],
+                [-8, 0.24, "obstacle"], [0, 0.24, "obstacle"], [8, 0.9, "clear"], [17, 1.2, "clear"],
+                [25, 1.4, "clear"], [34, 2.0, "far"], [42, 2.0, "far"]]
+RIGHT_BLOCKED = [[-d, m, k] for d, m, k in reversed(LEFT_BLOCKED)]
+SYMMETRIC = [[-42, 1.0, "clear"], [-25, 0.3, "obstacle"], [-8, 0.24, "obstacle"], [0, 0.24, "obstacle"],
+             [8, 0.24, "obstacle"], [25, 0.3, "obstacle"], [42, 1.0, "clear"]]
+FAR_DECIDES = [[-42, 2.5, "far"], [-34, 2.4, "far"], [-25, 0.3, "obstacle"], [-8, 0.25, "obstacle"],
+               [0, 0.24, "obstacle"], [8, 0.25, "obstacle"], [25, 0.3, "obstacle"], [34, 0.8, "clear"],
+               [42, 0.7, "clear"]]
+
+
+class CyclingDockWatch(ebo_server.DockWatch):
+    """Every poll a fresh reading; distances cycle through an approach (so each new watch stops
+    again); all readings carry the given depth sectors."""
+
+    def __init__(self, sectors, cycle=(0.6, 0.5, 0.4, 0.3, 0.24, 0.2, 0.18, 0.16, 0.14)):
+        super().__init__("http://127.0.0.1:9/none", None, None)
+        self.sectors, self.cycle, self.i = sectors, list(cycle), 0
+
+    def fetch(self):
+        v = self.cycle[self.i % len(self.cycle)]
+        self.i += 1
+        return {"seq": self.i, "frame_t": time.time(), "free_ahead_m": v, "free_ahead_kind": "obstacle",
+                "free_ahead_wide_m": v, "free_ahead_wide_kind": "obstacle", "wide_half_width_m": 0.17,
+                "sectors": self.sectors}
+
+
+class DockRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeVideoBridge(charge=0, video=True)
+        self.moves, self.docks = [], []
+        self.forward_ok = True
+
+        def fake_move(ly, rx, duration=0.4):
+            self.moves.append((round(ly, 2), round(rx, 2), round(duration, 2)))
+            if ly > 0 and not self.forward_ok:
+                return {"ok": False, "stopped_by_guard": True, "phase": "start", "reason": "obstacle 0.20 m"}
+            return {"ok": True}
+        for p in (mock.patch.object(ebo_server, "bridge", self.fake),
+                  mock.patch.object(ebo_server, "guard", None),
+                  mock.patch.object(ebo_server, "do_move", fake_move),
+                  mock.patch.object(ebo_server, "DOCKWATCH_POLL_S", 0.005),
+                  mock.patch.object(ebo_server, "DOCKWATCH_CONFIRM_S", 0.1),
+                  mock.patch.object(ebo_server, "DOCKWATCH_TIMEOUT_S", 3.0),
+                  mock.patch.object(ebo_server, "DOCKWATCH_RECOVER", True),
+                  mock.patch.object(ebo_server, "DOCKWATCH_RECOVER_MAX", 2),
+                  mock.patch.object(ebo_server, "DOCK_PREWAKE_S", 0),
+                  mock.patch.object(ebo_server, "GUARD_VIDEO_KEEP_URL", ""),
+                  mock.patch.object(ebo_server, "WEB_USER", None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_until(self, w, kinds, relaunch=False, timeout=6.0):
+        ctx = [mock.patch.object(ebo_server, "dockwatch", w)]
+        if not relaunch:
+            ctx.append(mock.patch.object(ebo_server, "do_action", lambda name: self.docks.append(name) or True))
+        for c in ctx:
+            c.start()
+        try:
+            w.start()
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                ev = w.status()["last_event"]
+                if ev and ev.get("kind") in kinds and not w.status()["active"]:
+                    return ev
+                time.sleep(0.01)
+            return w.status()["last_event"]
+        finally:
+            for c in reversed(ctx):
+                c.stop()
+
+    def test_side_decision(self):
+        self.assertEqual(ebo_server.dock_free_side(LEFT_BLOCKED)[0], "right")
+        self.assertEqual(ebo_server.dock_free_side(RIGHT_BLOCKED)[0], "left")
+        self.assertIsNone(ebo_server.dock_free_side(SYMMETRIC)[0])
+        side, info = ebo_server.dock_free_side(FAR_DECIDES)
+        self.assertEqual((side, info["basis"]), ("left", "far"))
+        self.assertIsNone(ebo_server.dock_free_side(None)[0])
+
+    def test_left_blocked_sidesteps_right_and_relaunches(self):
+        w = CyclingDockWatch(LEFT_BLOCKED)
+        ev = self.run_until(w, ("recovering",))
+        self.assertEqual(ev["kind"], "recovering", ev)
+        self.assertEqual(ev["side"], "right")
+        r = ebo_server.DOCKWATCH_TURN_RX
+        self.assertEqual(self.moves[0][:2], (0.0, round(r, 2)))           # turn right
+        self.assertGreater(self.moves[1][0], 0)                          # forward sidestep
+        self.assertEqual(self.moves[1][2], round(0.20 / 0.14, 2))
+        self.assertEqual(self.moves[2][:2], (0.0, round(-r, 2)))         # turn back
+        self.assertEqual(self.docks, ["dock"])
+        self.assertEqual(w.next_attempt, 1)
+        self.assertEqual(w.take_notice(),
+                         "docking blocked: obstacle 0.24 m on the left - sidestepped right, retrying (1/2)")
+
+    def test_right_blocked_sidesteps_left(self):
+        w = CyclingDockWatch(RIGHT_BLOCKED)
+        ev = self.run_until(w, ("recovering",))
+        self.assertEqual(ev["side"], "left")
+        self.assertLess(self.moves[0][1], 0)
+        self.assertGreater(self.moves[2][1], 0)
+
+    def test_forward_refused_aborts(self):
+        self.forward_ok = False
+        w = CyclingDockWatch(LEFT_BLOCKED)
+        ev = self.run_until(w, ("recovery_aborted",))
+        self.assertEqual(ev["kind"], "recovery_aborted", ev)
+        self.assertEqual(len(self.moves), 2)          # turn + refused forward, no turn back
+        self.assertEqual(self.docks, [])
+        self.assertIn("sidestep forward was refused", w.take_notice())
+
+    def test_ambiguous_does_not_move(self):
+        w = CyclingDockWatch(SYMMETRIC)
+        ev = self.run_until(w, ("stopped",))
+        self.assertEqual(ev.get("recovery"), "ambiguous", ev)
+        self.assertEqual(self.moves, [])
+        self.assertEqual(self.docks, [])
+        self.assertIn("no clearly freer side", w.take_notice())
+
+    def test_max_attempts_then_failed(self):
+        w = CyclingDockWatch(LEFT_BLOCKED)
+        ev = self.run_until(w, ("failed",), relaunch=True, timeout=8.0)
+        self.assertEqual(ev["kind"], "failed", ev)
+        self.assertEqual(ev["attempt"], 2)
+        self.assertEqual(len(self.moves), 6)          # 2 recoveries x (turn, forward, turn back)
+        self.assertEqual(self.fake.count(ebo_server.command_frame(ebo_server.CMD_DOCK)), 10)  # 2 relaunches x 5
+        n = w.take_notice()
+        self.assertIn("retrying (1/2)", n)
+        self.assertIn("retrying (2/2)", n)
+        self.assertTrue(n.endswith("docking failed after 2 attempts: obstacle 0.24 m ahead"), n)
+
+    def test_recovery_off_is_stop_only(self):
+        with mock.patch.object(ebo_server, "DOCKWATCH_RECOVER", False):
+            w = CyclingDockWatch(LEFT_BLOCKED)
+            ev = self.run_until(w, ("stopped",))
+        self.assertEqual(ev["kind"], "stopped")
+        self.assertEqual(self.moves, [])
+        self.assertEqual(self.docks, [])
+        self.assertEqual(w.take_notice(), "docking stopped: obstacle 0.24 m ahead")
+
+    def test_user_dock_resets_attempt(self):
+        w = CyclingDockWatch(LEFT_BLOCKED)
+        w.next_attempt = 0
+        w.start()
+        self.assertEqual(w.status()["watch"]["attempt"], 0)
+        w.watch_id += 1   # supersede the thread

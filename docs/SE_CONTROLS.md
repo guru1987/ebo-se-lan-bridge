@@ -172,3 +172,18 @@ Discovery publishes state-backed switches plus number entities for speaker
 volume, call volume, drive speed, security sensitivity, and notification
 interval. Switch and number state comes from robot echoes, not optimistic UI
 updates.
+
+### Dock watch recovery (2026-10-02)
+After a dock-watch STOP (obstacle closing in the wide corridor) the bridge tries to help the firmware
+routine instead of just stopping: it picks the freer side from the depth sectors (`/depth/live`
+`"sectors"`, deg < 0 = left; nearest distance in |deg| <= `EBO_DOCKWATCH_NEAR_DEG` (25) differing by
+>= `EBO_DOCKWATCH_SIDE_MIN_DIFF_M` (0.15), else the far sectors' mean; still unclear -> no movement,
+report), turns 90 deg toward it (`EBO_DOCKWATCH_TURN_RX` 0.6 for `EBO_DOCKWATCH_TURN_S` 1.0 s), drives
+`EBO_DOCKWATCH_SIDESTEP_M` (0.20 m at `EBO_DOCKWATCH_SIDESTEP_LY` 0.6 / `EBO_DOCKWATCH_SPEED_MPS` 0.14)
+through the normal forward depth guard (refused -> abort, "recovery_aborted"), turns back and relaunches
+the dock (pre-wake + a new watch). At most `EBO_DOCKWATCH_RECOVER_MAX` (2) retries, then "failed".
+`EBO_DOCKWATCH_RECOVER=0` = stop only (old behaviour). Events in `GET /dockwatch` (`kind`
+recovering / recovery_aborted / failed, `side`, `side_info`, `steps`, `attempt`); messages for the
+brother accumulate in the one-time `dockwatch_notice`, e.g. "docking blocked: obstacle 0.20 m on the
+left - sidestepped right, retrying (1/2)" / "docking failed after 2 attempts: obstacle 0.24 m ahead".
+Needs ebo-depth with `"sectors"` in its live reading; without sectors the side is ambiguous -> no movement.
