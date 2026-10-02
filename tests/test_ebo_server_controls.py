@@ -17,6 +17,8 @@ def state_bridge():
     bridge.parameters = {}
     bridge.parameter_meta = {}
     bridge.telemetry = {}
+    bridge.telemetry_updated = {}
+    bridge.raw_ids = {}
     bridge.timed_tasks = {1: {}, 2: {}, 3: {}}
     bridge._task_list_counts = {1: None, 2: None, 3: None}
     bridge.last_task_ack = None
@@ -85,6 +87,21 @@ class StateDecoderTests(unittest.TestCase):
         self.assertEqual((bridge.battery, bridge.charge), (91, 1))
         self.assertEqual(status, [(91, 1)])
         self.assertAlmostEqual(bridge.telemetry["battery"]["measured_voltage"], 8.1, places=5)
+
+    def test_raw_ids_and_telemetry_timestamps(self):
+        bridge = state_bridge()
+        bridge._parse_status(FrameBuilder().frame(207, struct.pack("<4fBB", 8.1, -0.1, 8.0, 8.4, 91, 0)))
+        bridge._parse_status(FrameBuilder().frame(163, struct.pack("<I3f", 1000, 0.1, -0.2, 1.5)))
+        self.assertEqual(bridge.raw_ids[207]["count"], 1)
+        self.assertEqual(bridge.raw_ids[163]["len"], 16)
+        self.assertIn("battery", bridge.telemetry_updated)
+        self.assertIn("attitude", bridge.telemetry_updated)
+        with mock.patch.object(ebo_server, "bridge", bridge):
+            out = ebo_server.telemetry()
+            ids = ebo_server.telemetry_raw_ids()
+        self.assertAlmostEqual(out["attitude_deg"]["roll"], 5.73, places=2)
+        self.assertIn("attitude", out["updated"])
+        self.assertEqual(ids["163"]["count"], 1)
 
     def test_zero_count_timed_task_item_is_an_empty_list_sentinel(self):
         bridge = state_bridge()

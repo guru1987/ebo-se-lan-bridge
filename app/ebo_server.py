@@ -12,7 +12,7 @@ Web panel:     EBO_WEB_USER EBO_WEB_PASS               (HTTP basic; disabled if 
 MQTT:          EBO_MQTT_HOST [EBO_MQTT_PORT EBO_MQTT_USER EBO_MQTT_PASS]
 Other:         EBO_DIR (/opt/ebo)  EBO_PORT (8000)  EBO_BIND (127.0.0.1)
 """
-import os, json, time, struct, threading, subprocess, secrets, socket, base64, urllib.request, urllib.error, http.cookiejar, tempfile
+import os, json, math, time, struct, threading, subprocess, secrets, socket, base64, urllib.request, urllib.error, http.cookiejar, tempfile
 from dataclasses import replace
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -195,6 +195,8 @@ class Bridge:
         self.parameters = {}
         self.parameter_meta = {}
         self.telemetry = {}
+        self.telemetry_updated = {}   # name -> unix time of the last frame that carried it
+        self.raw_ids = {}             # MAVLink id -> {"count", "last", "len"} (diagnostics)
         self.timed_tasks = {1: {}, 2: {}, 3: {}}
         self._task_list_counts = {1: None, 2: None, 3: None}
         self.last_task_ack = None
@@ -456,6 +458,10 @@ class Bridge:
     def _parse_status(self, u):
         for frame in self._mav_stream.feed(u):
             changed = []
+            raw = getattr(self, "raw_ids", None)
+            if raw is None: raw = self.raw_ids = {}
+            rec = raw.setdefault(frame.message_id, {"count": 0, "last": 0.0, "len": 0})
+            rec["count"] += 1; rec["last"] = time.time(); rec["len"] = len(frame.payload)
             try:
                 if frame.message_id == 228:
                     value = parse_parameter_value(frame.payload)
@@ -492,6 +498,10 @@ class Bridge:
                 if telemetry:
                     with self._state_condition:
                         self.telemetry.update(telemetry)
+                        now = time.time()
+                        upd = getattr(self, "telemetry_updated", None)
+                        if upd is None: upd = self.telemetry_updated = {}
+                        for name in telemetry: upd[name] = now
                         self._state_condition.notify_all()
                     for name, value in telemetry.items():
                         changed.append(("telemetry", name, value))
@@ -1745,7 +1755,21 @@ def parameter_write(group: str, key: str, body: ParameterWrite):
 
 @app.get("/telemetry")
 def telemetry():
-    return dict(bridge.telemetry)
+    out = dict(bridge.telemetry)
+    att = out.get("attitude")
+    if att:   # firmware reports radians; add degrees for people and brothers
+        out["attitude_deg"] = {k: round(math.degrees(att[k]), 2) for k in ("roll", "pitch", "yaw")}
+    upd = getattr(bridge, "telemetry_updated", {})
+    if upd:
+        out["updated"] = {k: round(v, 1) for k, v in upd.items()}
+    return out
+
+
+@app.get("/telemetry/raw_ids")
+def telemetry_raw_ids():
+    """Diagnostics: which MAVLink message ids arrived over RDT, how often, and when."""
+    now = time.time()
+    return {str(k): {**v, "age_s": round(now - v["last"], 1)} for k, v in sorted(bridge.raw_ids.items())}
 
 
 @app.get("/day-night")
