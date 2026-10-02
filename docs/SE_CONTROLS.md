@@ -42,6 +42,20 @@ when the depth guard is on, unless one fresh depth reading shows `stop_free_m` o
 ahead (a start-only check; the guard cannot stop a running firmware routine). `?force=1`
 skips both checks. Every trick call is logged as `[trick] SENT|REFUSED|FAILED {json}`.
 
+`POST /action/undock` drives straight forward off the dock: `EBO_UNDOCK_LY` (0.6) for
+`EBO_UNDOCK_S` (2.0 s, about 0.28 m; shorter or lower pulses stay in the robot's dead zone)
+through the same forward depth guard as `/move` (refused, or stopped mid-way, when free ahead
+< `stop_free_m`), then stops and polls the charge state for up to `EBO_UNDOCK_CHARGE_POLL_S`
+(2 s). It answers `{ok, moved_s, guard | stopped_by_guard + reason, charge_before,
+charge_after, left_dock}` and is logged as `[undock] {json}`.
+
+Forward moves (`/move`, `/drive`, undock, trick gate) with no fresh depth reading (the depth
+decoder idle or the video paused by ebo-eye) first wake the stream: ebo-eye
+`POST EBO_GUARD_VIDEO_KEEP_URL` (`/video_keep`), then the bridge's own video start if it is
+still not publishing; the guard's `/depth/live` polls keep the depth decoder running. They then
+wait until the stream is up plus `EBO_GUARD_WAKE_WAIT_S` (3 s) for a fresh reading (at most
+`EBO_GUARD_WAKE_MAX_S`, 10 s, after the wake) and still refuse without one. Logged as `[guard]`.
+
 `GET /actions` lists every accepted action name; tricks carry `"moves": true` and their
 command number.
 

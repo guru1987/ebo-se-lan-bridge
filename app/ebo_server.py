@@ -739,8 +739,7 @@ def do_action(name: str) -> bool:
         # ROLA sends exactly one COMMAND_MINI frame for a selected motion.
         bridge.send_rdt(command_frame(SPECIAL_MOTION_COMMANDS[name]))
     elif name == "undock":
-        for _ in range(6): bridge.send_rdt(motor_frame(ly=0.5)); time.sleep(0.05)
-        bridge.send_rdt(motor_frame())
+        do_undock()
     elif name == "autoreturn_off":
         bridge.set_auto_return(False)
     elif name == "autoreturn_on":
@@ -763,9 +762,19 @@ def do_action(name: str) -> bool:
 # not move without it. Turning (ly == 0) and backing (ly < 0) are never blocked.
 # stop_free_m: key of the JSON file EBO_GUARD_CONFIG (ebo-eye's body_config.json, which
 # validates it 0.05..1.5), re-read when the file changes; missing/invalid -> 0.25.
+# No fresh reading (depth decoder idle/not running, no reading yet, stale - typically because
+# ebo-eye paused the video while idle): a forward move first wakes the stream (DepthGuard.wake:
+# ebo-eye POST EBO_GUARD_VIDEO_KEEP_URL, then the bridge's own video start if still not ready;
+# the guard's /depth/live polls keep the depth decoder running), then waits until the stream is
+# up (video publishing + depth decoder running) and EBO_GUARD_WAKE_WAIT_S more for a fresh
+# reading (at most EBO_GUARD_WAKE_MAX_S after the wake). Still none -> refused. Logged [guard].
 GUARD_URL = os.environ.get("EBO_DEPTH_GUARD_URL", "").strip()
 GUARD_CONFIG = os.environ.get("EBO_GUARD_CONFIG", "").strip()
 GUARD_START_WAIT_S = float(os.environ.get("EBO_GUARD_START_WAIT_S", "5"))
+GUARD_WAKE_WAIT_S = float(os.environ.get("EBO_GUARD_WAKE_WAIT_S", "3"))
+GUARD_WAKE_MAX_S = float(os.environ.get("EBO_GUARD_WAKE_MAX_S", "10"))
+GUARD_VIDEO_KEEP_URL = os.environ.get("EBO_GUARD_VIDEO_KEEP_URL", "").strip()
+GUARD_DRIVE_WAIT_S = 0.3   # /drive: how long one call waits for a verdict before deciding to wake
 GUARD_STALE_S = 0.5
 GUARD_POLL_S = 0.03
 STOP_FREE_DEFAULT, STOP_FREE_MIN, STOP_FREE_MAX = 0.25, 0.05, 1.5
@@ -784,6 +793,9 @@ class DepthGuard:
         self.trip = None               # {"move_id", "reason", reading...} of the last guard stop
         self.verdict = (False, {"reason": "no depth reading yet"}, 0.0)   # (ok, info, monotonic t)
         self._cfg = (None, STOP_FREE_DEFAULT)
+        self._wake_lock = threading.Lock()
+        self._waking = False
+        self.drive_wait = threading.Lock()   # /drive: only one call at a time waits for a wake
         threading.Thread(target=self._loop, name="depth-guard", daemon=True).start()
 
     def stop_free_m(self):
@@ -815,9 +827,11 @@ class DepthGuard:
         except Exception as e:
             info["reason"] = f"depth down ({type(e).__name__})"
             return False, info
+        info["depth_running"] = bool(st.get("running"))
         rd = st.get("reading")
         if not rd:
             info["reason"] = "no depth reading yet" if st.get("running") else "depth not running"
+            info["no_fresh_reading"] = True
             return False, info
         free = rd.get("free_ahead_m")
         age = time.time() - float(rd.get("frame_t") or 0)
@@ -825,6 +839,7 @@ class DepthGuard:
                     floor=rd.get("floor_source"))
         if age > GUARD_STALE_S:
             info["reason"] = f"depth stale ({age:.2f} s old)"
+            info["no_fresh_reading"] = True
         elif free is None:
             info["reason"] = "distance ahead unknown (no floor scale)"
         elif rd.get("view_blocked"):
@@ -862,18 +877,90 @@ class DepthGuard:
         ok, info, t = self.verdict
         return (ok, info) if t >= since and time.monotonic() - t <= max_age else None
 
-    def wait_ready(self, timeout):
-        """Before a forward move: one fresh verdict taken after this call; wait for a good one."""
+    def _video_keep(self):
+        req = urllib.request.Request(GUARD_VIDEO_KEEP_URL, data=b"{}", method="POST",
+                                     headers={**self.hdr, "Content-Type": "application/json"})
+        with self.op.open(req, timeout=15) as r:
+            r.read()
+
+    def wake(self):
+        """No fresh depth reading: make sure the video stream runs (the depth decoder is kept running
+        by the guard's /depth/live polls). Like ebo-eye: its POST /video_keep (also resets its idle
+        pause timer), then - if video is still not publishing - the bridge's own video start.
+        Runs in the background; returns at once (False = a wake is already in progress)."""
+        with self._wake_lock:
+            if self._waking:
+                return False
+            self._waking = True
+
+        def run():
+            how, t0 = [], time.monotonic()
+            try:
+                if GUARD_VIDEO_KEEP_URL:
+                    try:
+                        self._video_keep()
+                        how.append("eye video_keep")
+                    except Exception as e:
+                        how.append(f"eye video_keep failed ({type(e).__name__})")
+                if bridge.paused:
+                    how.append("bridge paused (connection released), video not started")
+                elif not bridge.video_ready():
+                    how.append("bridge video start " + ("ok" if bridge.set_video(True) else "timed out"))
+                else:
+                    how.append("video publishing")
+            except Exception as e:
+                how.append(f"failed ({type(e).__name__})")
+            finally:
+                with self._wake_lock:
+                    self._waking = False
+            print(f"[guard] wake: {'; '.join(how)} ({time.monotonic() - t0:.2f} s)", flush=True)
+
+        threading.Thread(target=run, name="guard-wake", daemon=True).start()
+        return True
+
+    def stream_up(self, info):
+        """Video publishing and the depth decoder running (a fresh reading should follow)."""
+        return bool(info.get("depth_running")) and bridge.video_ready()
+
+    def wait_ready(self, timeout, wake_wait=None):
+        """Before a forward move: one fresh verdict taken after this call; wait for a good one.
+        If the verdict says there is no fresh reading, wake the stream (see wake) and wait until
+        it is up plus wake_wait (GUARD_WAKE_WAIT_S) for a fresh reading, at most GUARD_WAKE_MAX_S
+        after the wake; never shorter than timeout. The result's info carries "woke" then."""
+        wake_wait = GUARD_WAKE_WAIT_S if wake_wait is None else wake_wait
         t0 = time.monotonic()
+        deadline = t0 + timeout
+        woke = up_since = None
         last = (False, {"reason": "no depth reading yet", "stop_free_m": self.stop_free_m()})
-        while time.monotonic() - t0 < timeout:
+        while True:
+            now = time.monotonic()
             self.want()
             v = self.fresh_verdict(t0)
             if v:
                 last = v
                 if v[0]:
-                    return v
+                    break
+                if woke is None and v[1].get("no_fresh_reading"):
+                    woke = now
+                    print(f"[guard] no fresh depth reading ({v[1].get('reason')}): waking the stream, "
+                          f"waiting up to {wake_wait:.1f} s once it is up", flush=True)
+                    self.wake()
+                if woke is not None:
+                    if self.stream_up(v[1]):
+                        up_since = up_since or now
+                    else:
+                        up_since = None
+                    end = min(woke + GUARD_WAKE_MAX_S, (up_since + wake_wait) if up_since else woke + GUARD_WAKE_MAX_S)
+                    deadline = max(t0 + timeout, end)
+            if now >= deadline:
+                break
             time.sleep(0.02)
+        if woke is not None:
+            ok, info = last
+            info = {**info, "woke": True, "waited_s": round(time.monotonic() - t0, 2)}
+            print(f"[guard] after wake: {'fresh reading' if ok else 'still refused'} "
+                  f"{json.dumps(info)}", flush=True)
+            last = (ok, info)
         return last
 
 
@@ -948,9 +1035,38 @@ def do_move(ly: float, rx: float, duration: float = 0.4):
     if tripped is not None:
         return _guard_result(tripped, "moving", moved)
     ok, last, _ = guard.verdict
-    return {"ok": True, "moved_s": round(moved, 2),
-            "guard": {"free_ahead_m_start": start_info.get("free_ahead_m"),
-                      "free_ahead_m_end": last.get("free_ahead_m"), "stop_free_m": last.get("stop_free_m")}}
+    g = {"free_ahead_m_start": start_info.get("free_ahead_m"),
+         "free_ahead_m_end": last.get("free_ahead_m"), "stop_free_m": last.get("stop_free_m")}
+    if start_info.get("woke"):
+        g.update(woke=True, waited_s=start_info.get("waited_s"))
+    return {"ok": True, "moved_s": round(moved, 2), "guard": g}
+
+
+# ---- undock: a real straight-forward move off the charging dock ----
+# ROLA's dead zone swallows short/low pulses (the old 6 frames of ly 0.5 over 0.3 s barely moved
+# it), so undock drives straight forward at EBO_UNDOCK_LY for EBO_UNDOCK_S (0.6 x 2.0 s ~ 0.28 m)
+# through the same forward depth guard as /move (refused / stopped when free ahead < stop_free_m),
+# then stops and polls the charge state up to EBO_UNDOCK_CHARGE_POLL_S for 1 -> 0.
+UNDOCK_LY = float(os.environ.get("EBO_UNDOCK_LY", "0.6"))
+UNDOCK_S = float(os.environ.get("EBO_UNDOCK_S", "2.0"))
+UNDOCK_CHARGE_POLL_S = float(os.environ.get("EBO_UNDOCK_CHARGE_POLL_S", "2.0"))
+
+
+def do_undock(client: str = "-"):
+    charge_before = bridge.charge
+    res = do_move(UNDOCK_LY, 0.0, UNDOCK_S)
+    moved = res.get("phase") != "start"   # refused at the start = not moved at all
+    t0 = time.monotonic()
+    while moved and bridge.charge != 0 and time.monotonic() - t0 < UNDOCK_CHARGE_POLL_S:
+        time.sleep(0.1)
+    charge_after = bridge.charge
+    out = {**res, "action": "undock", "ly": UNDOCK_LY, "duration_s": UNDOCK_S,
+           "charge_before": charge_before, "charge_after": charge_after,
+           "left_dock": charge_before == 1 and charge_after == 0}
+    if moved:
+        out["charge_polled_s"] = round(time.monotonic() - t0, 2)
+    print(f"[undock] {json.dumps({**out, 'client': client})}", flush=True)
+    return out
 
 
 # ---------------- HTTP API + web panel (optional basic auth) ----------------
@@ -1321,6 +1437,7 @@ def move(m: Move, request: Request):
 # sends ONE motor frame (no trailing stop) so motion is continuous; a server-side watchdog
 # stops the robot if updates stop arriving (release, navigation away, network drop).
 _last_drive = 0.0
+_stop_count = 0   # POST /stop calls (a /drive that waited for depth does not move after one)
 
 @app.post("/drive")
 def drive(m: Move, request: Request):
@@ -1332,8 +1449,25 @@ def drive(m: Move, request: Request):
         # forward: only on a fresh good depth verdict; the guard thread stops it mid-way
         t_call = time.monotonic()
         guard.want(1.0)
+        v = guard.fresh_verdict(t_call - 0.15)
+        if v is None or (not v[0] and v[1].get("no_fresh_reading")):
+            # guard idle or no fresh reading (video paused): one call waits (waking the stream
+            # if needed), the others are refused at once; nothing moves after a /stop meanwhile
+            if not guard.drive_wait.acquire(blocking=False):
+                bridge.send_rdt(motor_frame())
+                return _guard_result({"reason": "waiting for depth (waking the stream)",
+                                      "stop_free_m": guard.stop_free_m()}, "drive")
+            try:
+                stops = _stop_count
+                v = guard.wait_ready(GUARD_DRIVE_WAIT_S)
+            finally:
+                guard.drive_wait.release()
+            if _stop_count != stops:
+                return _guard_result({**v[1], "reason": "stopped while waiting for depth"}, "drive")
+            t_call = time.monotonic()
         with guard.lock:
-            v = guard.fresh_verdict(t_call - 0.15)
+            if v is None or v[0]:   # re-check atomically with the motor frame
+                v = guard.fresh_verdict(t_call - 0.15)
             if v is None or not v[0]:
                 bridge.send_rdt(motor_frame())
                 _last_drive = 0.0
@@ -1358,8 +1492,9 @@ def _drive_watchdog():
 
 @app.post("/stop")
 def stop():
-    global _last_drive
+    global _last_drive, _stop_count
     _last_drive = 0.0
+    _stop_count += 1
     for _ in range(3): bridge.send_rdt(motor_frame()); time.sleep(0.02)
     return {"ok": True}
 
@@ -1420,6 +1555,8 @@ def do_trick(name: str, force: bool = False, client: str = "-"):
 def action(name: str, request: Request, force: int = 0):
     if name in SPECIAL_MOTION_COMMANDS:
         return do_trick(name, bool(force), request.client.host if request.client else "-")
+    if name == "undock":
+        return do_undock(request.client.host if request.client else "-")
     return {"ok": True, "action": name} if do_action(name) else {"ok": False, "err": "unknown"}
 
 @app.post("/connection/{state}")

@@ -314,9 +314,12 @@ class DockGuardRailTests(unittest.TestCase):
                 self.assertTrue(c.post(path, json={"ly": ly, "rx": rx, "duration": 0.2}).json()["ok"])
                 self.fake.send_rdt.assert_called()
 
-    def test_dock_and_undock_actions_unchanged(self):
+    def test_dock_and_undock_actions_allowed_on_the_dock(self):
         c = self.client(1)
-        self.assertEqual(c.post("/action/undock").json(), {"ok": True, "action": "undock"})
+        with mock.patch.object(ebo_server, "UNDOCK_CHARGE_POLL_S", 0.0):
+            r = c.post("/action/undock").json()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["action"], "undock")
         self.assertEqual(c.post("/action/dock").json(), {"ok": True, "action": "dock"})
 
 
@@ -403,6 +406,253 @@ class VideoAndAudioPublicationTests(unittest.TestCase):
         bridge.send_ioctl = lambda *_: self.fail("invalid quality must not be sent")
         with self.assertRaisesRegex(ValueError, "auto, high, medium, or low"):
             bridge.set_video_quality("ultra")
+
+
+NO_READING = {"reason": "depth not running", "no_fresh_reading": True, "depth_running": False}
+
+
+def good(free=1.0):
+    return {"free_ahead_m": free, "depth_running": True, "depth_age_s": 0.05}
+
+
+def too_close(free=0.1):
+    return {"free_ahead_m": free, "depth_running": True, "reason": "too close"}
+
+
+class ScriptedGuard(ebo_server.DepthGuard):
+    """Real DepthGuard (thread, verdicts, wait/wake logic) with check() scripted: script(t) -> info
+    (t = seconds since the first check) where info without "reason" means ok."""
+
+    def __init__(self, script):
+        self.script, self.t0 = script, None
+        super().__init__("http://127.0.0.1:9/none", "", None, None)
+
+    def check(self):
+        if self.t0 is None:
+            self.t0 = time.monotonic()
+        info = {"stop_free_m": 0.25, **self.script(time.monotonic() - self.t0)}
+        return "reason" not in info, info
+
+
+class FakeVideoBridge:
+    """Bridge stand-in: records motor frames; video starts paused; set_video(True) resumes it."""
+
+    def __init__(self, charge=1, video=False):
+        self.charge, self.battery, self.paused = charge, 80, False
+        self.video = video
+        self.frames = []
+        self.set_video_calls = 0
+        self.lock = threading.Lock()
+
+    def send_rdt(self, frame):
+        with self.lock:
+            self.frames.append(frame)
+
+    def video_ready(self):
+        return self.video
+
+    def set_video(self, enabled, timeout=12):
+        self.set_video_calls += 1
+        self.video_resumed_at = time.monotonic()
+        self.video = enabled
+        return enabled
+
+    def count(self, frame):
+        with self.lock:
+            return self.frames.count(frame)
+
+
+class GuardWakeTests(unittest.TestCase):
+    """No fresh depth reading (video paused by ebo-eye): wake the stream, wait, then decide."""
+
+    def setUp(self):
+        self.fake = FakeVideoBridge()
+        for p in (mock.patch.object(ebo_server, "bridge", self.fake),
+                  mock.patch.object(ebo_server, "GUARD_VIDEO_KEEP_URL", ""),
+                  mock.patch.object(ebo_server, "WEB_USER", None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def resumed_script(self, up_after=0.3, reading_after=0.5, reading=good):
+        """No reading until the video is resumed; decoder up up_after s later; reading after that."""
+        def script(_t):
+            t = getattr(self.fake, "video_resumed_at", None)
+            if t is None:
+                return NO_READING
+            dt = time.monotonic() - t
+            if dt < up_after:
+                return NO_READING
+            if dt < reading_after:
+                return {"reason": "no depth reading yet", "no_fresh_reading": True, "depth_running": True}
+            return reading()
+        return script
+
+    def test_wakes_video_and_waits_for_a_fresh_reading(self):
+        g = ScriptedGuard(self.resumed_script())
+        ok, info = g.wait_ready(0.1, wake_wait=1.0)   # the start window alone (0.1 s) is too short
+        self.assertTrue(ok, info)
+        self.assertTrue(info["woke"])
+        self.assertEqual(info["free_ahead_m"], 1.0)
+        self.assertEqual(self.fake.set_video_calls, 1)
+
+    def test_still_refused_when_no_reading_arrives(self):
+        g = ScriptedGuard(lambda _t: {"reason": "no depth reading yet", "no_fresh_reading": True,
+                                      "depth_running": True})
+        t0 = time.monotonic()
+        ok, info = g.wait_ready(0.1, wake_wait=0.3)
+        waited = time.monotonic() - t0
+        self.assertFalse(ok)
+        self.assertTrue(info["woke"])
+        self.assertIn("no depth reading", info["reason"])
+        self.assertGreater(waited, 0.3)
+        self.assertLess(waited, 1.0)
+
+    def test_wake_wait_is_capped_when_the_stream_never_comes_up(self):
+        g = ScriptedGuard(lambda _t: NO_READING)
+        with mock.patch.object(ebo_server, "GUARD_WAKE_MAX_S", 0.4):
+            t0 = time.monotonic()
+            ok, info = g.wait_ready(0.1, wake_wait=5.0)
+        self.assertFalse(ok)
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_fresh_but_too_close_is_not_a_wake(self):
+        g = ScriptedGuard(lambda _t: too_close())
+        ok, info = g.wait_ready(0.2)
+        self.assertFalse(ok)
+        self.assertNotIn("woke", info)
+        self.assertEqual(self.fake.set_video_calls, 0)
+
+    def test_wake_asks_ebo_eye_first(self):
+        g = ScriptedGuard(lambda _t: NO_READING)
+        keep = mock.Mock(side_effect=lambda: setattr(self.fake, "video", True))
+        with mock.patch.object(ebo_server, "GUARD_VIDEO_KEEP_URL", "http://eye/video_keep"), \
+                mock.patch.object(g, "_video_keep", keep):
+            self.assertTrue(g.wake())
+            for _ in range(100):
+                if not g._waking:
+                    break
+                time.sleep(0.01)
+        keep.assert_called_once()
+        self.assertEqual(self.fake.set_video_calls, 0)   # eye already resumed it
+
+    def test_forward_move_wakes_then_moves(self):
+        g = ScriptedGuard(self.resumed_script())
+        with mock.patch.object(ebo_server, "guard", g), \
+                mock.patch.object(ebo_server, "GUARD_START_WAIT_S", 0.1), \
+                mock.patch.object(ebo_server, "GUARD_WAKE_WAIT_S", 1.0):
+            r = ebo_server.do_move(0.5, 0.0, 0.2)
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r["guard"]["woke"])
+        self.assertGreaterEqual(self.fake.count(ebo_server.motor_frame(ly=0.5)), 1)
+
+    def test_forward_move_refused_without_reading_sends_no_motion(self):
+        g = ScriptedGuard(lambda _t: NO_READING)
+        with mock.patch.object(ebo_server, "guard", g), \
+                mock.patch.object(ebo_server, "GUARD_START_WAIT_S", 0.1), \
+                mock.patch.object(ebo_server, "GUARD_WAKE_MAX_S", 0.3):
+            r = ebo_server.do_move(0.5, 0.0, 0.2)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["phase"], "start")
+        self.assertTrue(r["woke"])
+        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.5)), 0)
+
+    def test_drive_wakes_then_moves(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        g = ScriptedGuard(self.resumed_script())
+        with mock.patch.object(ebo_server, "guard", g), \
+                mock.patch.object(ebo_server, "GUARD_WAKE_WAIT_S", 1.0):
+            r = TestClient(ebo_server.app).post("/drive", json={"ly": 0.5, "rx": 0}).json()
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.fake.set_video_calls, 1)
+        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.5)), 1)
+
+
+class UndockTests(unittest.TestCase):
+    """Undock = a straight forward move (EBO_UNDOCK_LY x EBO_UNDOCK_S) through the forward guard."""
+
+    def setUp(self):
+        self.fake = FakeVideoBridge(charge=1, video=True)
+        orig = self.fake.send_rdt
+
+        def send(frame):   # the robot leaves the dock once it is driven off and stopped
+            orig(frame)
+            if frame == ebo_server.motor_frame() and self.fake.count(ebo_server.motor_frame(ly=0.6)) >= 1:
+                self.fake.charge = 0
+        self.fake.send_rdt = send
+        for p in (mock.patch.object(ebo_server, "bridge", self.fake),
+                  mock.patch.object(ebo_server, "GUARD_VIDEO_KEEP_URL", ""),
+                  mock.patch.object(ebo_server, "WEB_USER", None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_defaults_are_a_real_move(self):
+        self.assertEqual((ebo_server.UNDOCK_LY, ebo_server.UNDOCK_S), (0.6, 2.0))
+
+    def test_undock_drives_full_duration_and_reports_charge(self):
+        with mock.patch.object(ebo_server, "guard", None), \
+                mock.patch.object(ebo_server.time, "sleep", lambda _s: None):
+            r = ebo_server.do_undock()
+        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.6)), 40)   # 2.0 s at 20 Hz
+        self.assertEqual(self.fake.frames[-1], ebo_server.motor_frame())
+        self.assertTrue(r["ok"])
+        self.assertEqual((r["charge_before"], r["charge_after"], r["left_dock"]), (1, 0, True))
+        self.assertEqual((r["ly"], r["duration_s"]), (0.6, 2.0))
+
+    def test_undock_endpoint_allowed_while_docked(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        g = ScriptedGuard(lambda _t: good(0.9))
+        with mock.patch.object(ebo_server, "guard", g), mock.patch.object(ebo_server, "UNDOCK_S", 0.3):
+            r = TestClient(ebo_server.app).post("/action/undock").json()
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["action"], "undock")
+        self.assertTrue(r["left_dock"])
+        self.assertEqual(r["guard"]["free_ahead_m_start"], 0.9)
+        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.6)), 6)
+
+    def test_undock_refused_by_guard_does_not_move(self):
+        g = ScriptedGuard(lambda _t: too_close(0.12))
+        with mock.patch.object(ebo_server, "guard", g), mock.patch.object(ebo_server, "GUARD_START_WAIT_S", 0.2):
+            r = ebo_server.do_undock()
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["stopped_by_guard"])
+        self.assertEqual(r["phase"], "start")
+        self.assertEqual(r["free_ahead_m"], 0.12)
+        self.assertEqual((r["charge_after"], r["left_dock"]), (1, False))
+        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.6)), 0)
+
+    def test_undock_stopped_mid_way_by_guard(self):
+        g = ScriptedGuard(lambda t: good(0.6) if t < 0.3 else too_close(0.2))
+        with mock.patch.object(ebo_server, "guard", g), mock.patch.object(ebo_server, "UNDOCK_S", 2.0), \
+                mock.patch.object(ebo_server, "UNDOCK_CHARGE_POLL_S", 0.2):
+            r = ebo_server.do_undock()
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["phase"], "moving")
+        self.assertLess(r["moved_s"], 1.5)
+        self.assertLess(self.fake.count(ebo_server.motor_frame(ly=0.6)), 30)
+        self.assertEqual(self.fake.frames[-1], ebo_server.motor_frame())
+
+    def test_undock_waits_for_reading_when_video_paused(self):
+        self.fake.video = False
+        state = {}
+
+        def script(_t):
+            if self.fake.set_video_calls == 0:
+                return NO_READING
+            state.setdefault("t", time.monotonic())
+            return good(1.2) if time.monotonic() - state["t"] > 0.3 else NO_READING
+        g = ScriptedGuard(script)
+        with mock.patch.object(ebo_server, "guard", g), mock.patch.object(ebo_server, "UNDOCK_S", 0.3), \
+                mock.patch.object(ebo_server, "GUARD_START_WAIT_S", 0.1):
+            r = ebo_server.do_undock()
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r["guard"]["woke"])
+        self.assertTrue(r["left_dock"])
 
 
 if __name__ == "__main__":
