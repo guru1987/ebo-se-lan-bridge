@@ -74,6 +74,12 @@ stop it re-sends the stop for `EBO_DOCKWATCH_CONFIRM_S` (3 s) if the distance ke
 firmware routine is untested. State: `GET /dockwatch`, `/info` `dockwatch`; a stop is attached once
 to the next `/action` or `/move` result as `dockwatch_notice` ("docking stopped: obstacle 0.20 m
 ahead"). Logged as `[dockwatch]`. `EBO_DOCKWATCH=0` disables it.
+Dock pre-wake: a paused stream needs ~5-7 s to its first depth reading, while the routine can
+dock in under 7 s (first live run: 3 readings, 63 blind polls). So before CMD_DOCK the guard wakes
+the stream and waits up to `EBO_DOCK_PREWAKE_S` (8 s, 0 = off) for a fresh reading with a floor
+scale, then docks regardless (it never refuses). The result is in the dock response (`prewake`:
+waited_s, woke, reading, scaled, free_ahead_m) and in the watch state; the watch also counts
+`unscaled` readings (no floor scale even after the depth service's 10 s last-scale fallback).
 
 `GET /actions` lists every accepted action name; tricks carry `"moves": true` and their
 command number.

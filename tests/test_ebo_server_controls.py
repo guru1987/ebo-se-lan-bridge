@@ -865,5 +865,120 @@ class DockWatchTests(unittest.TestCase):
         self.assertEqual(self.fake.count(ebo_server.command_frame(ebo_server.CMD_DOCK)), 5)
 
 
+
+class TimedVideoBridge(FakeVideoBridge):
+    """FakeVideoBridge that also records when each frame was sent (monotonic)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.sent = []
+
+    def send_rdt(self, frame):
+        super().send_rdt(frame)
+        with self.lock:
+            self.sent.append((time.monotonic(), frame))
+
+    def first(self, frame):
+        with self.lock:
+            return next((t for t, f in self.sent if f == frame), None)
+
+
+class DockPrewakeTests(unittest.TestCase):
+    """Before CMD_DOCK the guard wakes the stream and waits for a fresh floor-scaled reading
+    (the dock watch was blind for a whole 6.8 s dock routine); it never refuses to dock."""
+
+    def setUp(self):
+        self.fake = TimedVideoBridge(charge=0, video=False)
+        for p in (mock.patch.object(ebo_server, "bridge", self.fake),
+                  mock.patch.object(ebo_server, "dockwatch", None),
+                  mock.patch.object(ebo_server, "GUARD_VIDEO_KEEP_URL", ""),
+                  mock.patch.object(ebo_server, "WEB_USER", None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def scripted(self, script):
+        g = ScriptedGuard(script)
+        p = mock.patch.object(ebo_server, "guard", g)
+        p.start()
+        self.addCleanup(p.stop)
+        return g
+
+    def test_waits_for_scaled_reading_before_cmd_dock(self):
+        marks = {}
+
+        def script(t):
+            if not self.fake.video:   # paused: no fresh reading until the wake starts the video
+                return {"reason": "depth stale (9 s old)", "no_fresh_reading": True, "depth_running": True}
+            if t < 0.4:               # fresh but the camera is still settling: no floor scale
+                return {"reason": "distance ahead unknown (no floor scale)", "no_scale": True,
+                        "free_ahead_m": None, "depth_running": True}
+            marks.setdefault("scaled", time.monotonic())
+            return {"free_ahead_m": 1.2, "depth_running": True}
+        self.scripted(script)
+        with mock.patch.object(ebo_server, "DOCK_PREWAKE_S", 3.0):
+            self.assertTrue(ebo_server.do_action("dock"))
+        pre = ebo_server._last_dock_prewake
+        self.assertTrue(pre["woke"], pre)
+        self.assertTrue(pre["scaled"], pre)
+        self.assertEqual(pre["free_ahead_m"], 1.2)
+        self.assertEqual(self.fake.set_video_calls, 1)
+        dock = ebo_server.command_frame(ebo_server.CMD_DOCK)
+        self.assertEqual(self.fake.count(dock), 5)
+        self.assertGreaterEqual(self.fake.first(dock), marks["scaled"])   # CMD_DOCK only after the reading
+
+    def test_no_reading_within_limit_still_docks(self):
+        self.scripted(lambda t: {"reason": "depth not running", "no_fresh_reading": True})
+        with mock.patch.object(ebo_server, "DOCK_PREWAKE_S", 0.3):
+            t0 = time.monotonic()
+            self.assertTrue(ebo_server.do_action("dock"))
+            self.assertLess(time.monotonic() - t0, 2.0)
+        pre = ebo_server._last_dock_prewake
+        self.assertFalse(pre["reading"], pre)
+        self.assertFalse(pre["scaled"], pre)
+        self.assertEqual(self.fake.count(ebo_server.command_frame(ebo_server.CMD_DOCK)), 5)
+
+    def test_reading_already_flowing_docks_at_once(self):
+        self.fake.video = True
+        self.scripted(lambda t: {"free_ahead_m": 0.9, "depth_running": True})
+        with mock.patch.object(ebo_server, "DOCK_PREWAKE_S", 3.0):
+            self.assertTrue(ebo_server.do_action("dock"))
+        pre = ebo_server._last_dock_prewake
+        self.assertFalse(pre["woke"], pre)
+        self.assertTrue(pre["scaled"], pre)
+        self.assertLess(pre["waited_s"], 0.5)
+        self.assertEqual(self.fake.set_video_calls, 0)
+
+    def test_prewake_off(self):
+        g = self.scripted(lambda t: {"reason": "depth not running", "no_fresh_reading": True})
+        with mock.patch.object(ebo_server, "DOCK_PREWAKE_S", 0.0), \
+                mock.patch.object(ebo_server.time, "sleep", lambda _s: None):
+            self.assertTrue(ebo_server.do_action("dock"))
+        self.assertIsNone(ebo_server._last_dock_prewake)
+        self.assertEqual(self.fake.set_video_calls, 0)
+
+    def test_dock_response_and_watch_carry_prewake(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        self.fake.video = True
+        self.scripted(lambda t: {"free_ahead_m": 0.8, "depth_running": True})
+        w = ScriptedDockWatch([0.8])
+        with mock.patch.object(ebo_server, "dockwatch", w), \
+                mock.patch.object(ebo_server, "DOCK_PREWAKE_S", 2.0), \
+                mock.patch.object(ebo_server, "DOCKWATCH_TIMEOUT_S", 0.3), \
+                mock.patch.object(ebo_server, "DOCKWATCH_POLL_S", 0.01):
+            r = TestClient(ebo_server.app).post("/action/dock").json()
+            self.assertTrue(r["ok"])
+            self.assertTrue(r["prewake"]["scaled"], r)
+            self.assertEqual(w.status()["watch"]["prewake"]["free_ahead_m"], 0.8)
+            t0 = time.monotonic()
+            while w.status()["active"] and time.monotonic() - t0 < 2:
+                time.sleep(0.01)
+            ev = w.status()["last_event"]
+            self.assertEqual(ev["prewake"]["free_ahead_m"], 0.8)
+            self.assertIn("unscaled", ev)
+
+
 if __name__ == "__main__":
     unittest.main()

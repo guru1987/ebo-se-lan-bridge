@@ -732,11 +732,27 @@ class Bridge:
 
 
 # ---------------- actions (shared by REST + MQTT) ----------------
+# Dock pre-wake: the firmware dock routine can finish in a few seconds, while a paused stream needs
+# ~5-7 s until the first depth reading - the dock watch was blind for nearly the whole routine
+# (2026-10-02: 3 readings, 63 blind polls in 6.8 s). So before CMD_DOCK the guard wakes the stream and
+# waits up to EBO_DOCK_PREWAKE_S for a fresh, floor-scaled reading; it never refuses to dock.
+# 0 = off. The result is in the /action/dock response ("prewake") and in the dock watch state.
+DOCK_PREWAKE_S = float(os.environ.get("EBO_DOCK_PREWAKE_S", "8"))
+_last_dock_prewake = None
+
+
 def do_action(name: str) -> bool:
+    global _last_dock_prewake
     if name == "dock":
+        _last_dock_prewake = None
+        if guard is not None and DOCK_PREWAKE_S > 0:
+            try:
+                _last_dock_prewake = guard.wait_reading(DOCK_PREWAKE_S)
+            except Exception as e:   # never block docking on the pre-wake
+                _last_dock_prewake = {"error": type(e).__name__}
         for _ in range(5): bridge.send_rdt(command_frame(CMD_DOCK)); time.sleep(0.15)
         if dockwatch is not None:
-            dockwatch.start()
+            dockwatch.start(prewake=_last_dock_prewake)
     elif name in SPECIAL_MOTION_COMMANDS:
         # ROLA sends exactly one COMMAND_MINI frame for a selected motion.
         bridge.send_rdt(command_frame(SPECIAL_MOTION_COMMANDS[name]))
@@ -985,6 +1001,38 @@ class DepthGuard:
             last = (ok, info)
         return last
 
+    def wait_reading(self, max_s):
+        """Before the firmware dock routine (CMD_DOCK, not a bridge move): make sure depth readings
+        flow - wake the stream if there is no fresh reading (the polls also hold the depth decoder) -
+        and wait up to max_s for a fresh reading WITH a floor scale (free_ahead_m not null). Never
+        refuses (the robot must still be able to dock): returns what it got."""
+        t0 = time.monotonic()
+        woke, got = False, None
+        while True:
+            now = time.monotonic()
+            self.want()
+            v = self.fresh_verdict(t0)
+            if v:
+                info = v[1]
+                if info.get("no_fresh_reading"):
+                    if not woke:
+                        woke = True
+                        print(f"[dock] no fresh depth reading ({info.get('reason')}): waking the stream, "
+                              f"waiting up to {max_s:.1f} s before the dock routine", flush=True)
+                        self.wake()
+                else:
+                    got = info
+                    if info.get("free_ahead_m") is not None:
+                        break
+            if now - t0 >= max_s:
+                break
+            time.sleep(0.02)
+        out = {"waited_s": round(time.monotonic() - t0, 2), "woke": woke, "reading": got is not None,
+               "scaled": bool(got and got.get("free_ahead_m") is not None),
+               "free_ahead_m": got.get("free_ahead_m") if got else None}
+        print(f"[dock] prewake {json.dumps(out)}", flush=True)
+        return out
+
 
 guard = None
 
@@ -1155,13 +1203,13 @@ class DockWatch:
         with self.op.open(urllib.request.Request(self.url, headers=self.hdr), timeout=0.5) as r:
             return json.loads(r.read()).get("reading")
 
-    def start(self, client="-"):
+    def start(self, client="-", prewake=None):
         with self.lock:
             self.watch_id += 1
             wid = self.watch_id
             self.current = {"watch_id": wid, "started": time.time(), "client": client, "readings": 0,
-                            "blind": 0, "last_free_m": None, "corridor": None, "history": [],
-                            "stopped": False}
+                            "blind": 0, "unscaled": 0, "last_free_m": None, "corridor": None, "history": [],
+                            "stopped": False, "prewake": prewake}
         print(f"[dockwatch] watching dock routine #{wid} {json.dumps(dockwatch_config())}", flush=True)
         threading.Thread(target=self._run, args=(wid,), name="dockwatch", daemon=True).start()
         return {"watching": True, "watch_id": wid, "stop_m": DOCKWATCH_STOP_M, "timeout_s": DOCKWATCH_TIMEOUT_S}
@@ -1194,7 +1242,8 @@ class DockWatch:
             cur = self.current or {}
             event = {"watch_id": wid, "t": time.time(),
                      "elapsed_s": round(time.time() - cur.get("started", time.time()), 1),
-                     "readings": cur.get("readings", 0), "blind": cur.get("blind", 0), **event}
+                     "readings": cur.get("readings", 0), "blind": cur.get("blind", 0),
+                     "unscaled": cur.get("unscaled", 0), "prewake": cur.get("prewake"), **event}
             self.last_event = event
             self.current = None
         print(f"[dockwatch] end {json.dumps(event)}", flush=True)
@@ -1248,7 +1297,8 @@ class DockWatch:
             with self.lock:
                 if self.current and self.watch_id == wid:
                     self.current.update(readings=self.current["readings"] + 1, last_free_m=free,
-                                        last_kind=kind, corridor=corridor, history=list(values))
+                                        last_kind=kind, corridor=corridor, history=list(values),
+                                        unscaled=self.current.get("unscaled", 0) + (free is None))
             if free is None or kind == "blocked":
                 time.sleep(DOCKWATCH_POLL_S)
                 continue
@@ -1810,6 +1860,8 @@ def action(name: str, request: Request, force: int = 0):
                                 "timeout_s": DOCKWATCH_TIMEOUT_S}
         else:
             out["dockwatch"] = {"watching": False}
+        if _last_dock_prewake is not None:
+            out["prewake"] = _last_dock_prewake
         if notice:
             out["dockwatch_notice"] = notice
         return out
