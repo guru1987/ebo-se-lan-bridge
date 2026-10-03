@@ -1,0 +1,26 @@
+[Unit]
+Description=EBO SE LAN-only Kalay registration responder
+Documentation=file:/opt/ebo-se-lan-bridge/docs/LOCAL_RESPONDER.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ebo-bridge
+Group=ebo-bridge
+WorkingDirectory=/opt/ebo-se-lan-bridge
+EnvironmentFile=/etc/ebo-local-responder.env
+ExecStart=/usr/bin/python3 /opt/ebo-se-lan-bridge/tools/ebo_local_responder.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET
+
+[Install]
+WantedBy=multi-user.target

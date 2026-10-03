@@ -48,6 +48,7 @@ original deployment is ARM32; ARM64 is supported for hardware such as the ODROID
 | `app/ebo.html` | web panel (live video + d-pad) |
 | `app/mediamtx.template.yml` | RTSP/WebRTC/HLS server config (auth injected at start) |
 | `app/run.sh` | container entrypoint |
+| `tools/ebo_local_responder.py` | optional LAN-only Kalay registration responder |
 | `Dockerfile`, `docker-compose.yml` | packaging |
 | `vendor/` | **you provide**: TUTK `.so`, bionic runtime, optional `ioctl9930.bin` (gitignored) |
 
@@ -80,6 +81,20 @@ time and always sends the native
 speaker STOP command when the button is released or the WebSocket disconnects. See
 [docs/TALKBACK.md](docs/TALKBACK.md) for the tested wire format and validation notes.
 For an x86-64, non-Docker deployment see [docs/HOST_QEMU.md](docs/HOST_QEMU.md).
+
+## Optional offline status responder
+
+An EBO blocked from the vendor network can keep a fast orange status LED even while this
+LAN bridge works. The optional, separately installed `ebo-local-responder` answers only the
+device-registration traffic on UDP/10240 and UDP/3478. It does not proxy media, authenticate
+viewers, or open a robot-control session. Its source allowlist and 20-character robot UID are
+mandatory.
+
+The first experimental replay was unsafe: an unrelated 78-byte reply caused registration to
+restart about every 125 seconds, dropping the bridge session and coinciding with unexpected
+turns. The packaged responder generates the observed 56-byte, request-bound registration ACK
+instead and rejects unknown packet shapes. Do not enable router redirects until the installation
+and ten-minute coexistence checks in [docs/LOCAL_RESPONDER.md](docs/LOCAL_RESPONDER.md) are ready.
 
 ## Security
 

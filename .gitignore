@@ -1,5 +1,6 @@
 # Secrets — never commit
 .env
+tools/ebo-local-responder.env
 
 # Vendor binaries (proprietary TUTK SDK + Android bionic runtime). Provide them locally;
 # see docs/SETUP.md. Distributing ThroughTek's libraries is not allowed.

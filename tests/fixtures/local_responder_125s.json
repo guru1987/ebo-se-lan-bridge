@@ -1,0 +1,17 @@
+{
+  "note": "Redacted shape/timing fixture derived from the owned EBO capture; all identity and endpoint values are synthetic.",
+  "events": [
+    {"at": 0.0, "kind": "master", "expect": 126},
+    {"at": 0.1, "kind": "probe", "expect": 40},
+    {"at": 0.2, "kind": "login", "expect": 44},
+    {"at": 0.3, "kind": "register", "expect": 56},
+    {"at": 10.3, "kind": "keepalive", "expect": null},
+    {"at": 40.3, "kind": "register", "expect": 56},
+    {"at": 80.3, "kind": "register", "expect": 56},
+    {"at": 120.3, "kind": "register", "expect": 56},
+    {"at": 125.0, "kind": "master", "expect": 126},
+    {"at": 125.1, "kind": "probe", "expect": 40},
+    {"at": 125.2, "kind": "login", "expect": 44},
+    {"at": 125.3, "kind": "register", "expect": 56}
+  ]
+}
