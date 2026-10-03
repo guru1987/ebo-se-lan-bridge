@@ -662,7 +662,7 @@ class UndockTests(unittest.TestCase):
         with mock.patch.object(ebo_server, "guard", None), \
                 mock.patch.object(ebo_server.time, "sleep", lambda _s: None):
             r = ebo_server.do_undock()
-        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.6)), 40)   # 2.0 s at 20 Hz
+        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.6)), ebo_server.motor_frame_count(2.0))   # 2.0 s of frames
         self.assertEqual(self.fake.frames[-1], ebo_server.motor_frame())
         self.assertTrue(r["ok"])
         self.assertEqual((r["charge_before"], r["charge_after"], r["left_dock"]), (1, 0, True))
@@ -680,7 +680,7 @@ class UndockTests(unittest.TestCase):
         self.assertEqual(r["action"], "undock")
         self.assertTrue(r["left_dock"])
         self.assertEqual(r["guard"]["free_ahead_m_start"], 0.9)
-        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.6)), 6)
+        self.assertEqual(self.fake.count(ebo_server.motor_frame(ly=0.6)), ebo_server.motor_frame_count(0.3))
 
     def test_undock_refused_by_guard_does_not_move(self):
         g = ScriptedGuard(lambda _t: too_close(0.12))
@@ -1324,3 +1324,85 @@ class PreDockBlockedTests(unittest.TestCase):
         self.assertEqual(self.docks_sent(), 0)
         self.assertEqual(w.take_notice(),
                          "docking failed after 2 attempts: blocked before docking, obstacle 0.12 m ahead")
+
+
+class WarmupAndFrameTimingTests(unittest.TestCase):
+    """Idle-link warm-up and 20 ms motor frames (porch tools/turncal run5/run6, 2026-10-03)."""
+
+    def setUp(self):
+        self.sent = []
+        fake = mock.Mock()
+        fake.send_rdt.side_effect = lambda b: self.sent.append(b)
+        self.patches = [mock.patch.object(ebo_server, "bridge", fake),
+                        mock.patch.object(ebo_server, "guard", None),
+                        mock.patch.object(ebo_server, "WARMUP_S", 0.1),
+                        mock.patch.object(ebo_server, "WARMUP_IDLE_S", 0.3),
+                        mock.patch.object(ebo_server, "MOTOR_FRAME_S", 0.02)]
+        for p in self.patches:
+            p.start()
+        ebo_server._motor_last_t = 0.0   # idle link
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+    def zeros(self):
+        return self.sent.count(ebo_server.motor_frame())
+
+    def test_warmup_only_from_idle(self):
+        r = ebo_server.do_move(0.0, 0.6, 0.1)
+        self.assertEqual(r["warmup_s"] > 0, True, r)
+        first_motion = self.sent.index(ebo_server.motor_frame(rx=0.6))
+        self.assertEqual(first_motion, 5)                       # 0.1 s of zero frames at 20 ms
+        self.assertTrue(all(f == ebo_server.motor_frame() for f in self.sent[:first_motion]))
+        self.sent.clear()
+        r2 = ebo_server.do_move(0.0, -0.6, 0.1)                # back-to-back: link still warm
+        self.assertEqual(r2["warmup_s"], 0.0)
+        self.assertEqual(self.sent[0], ebo_server.motor_frame(rx=-0.6))
+
+    def test_duration_rounded_to_nearest_frame(self):
+        ebo_server._motor_last_t = time.monotonic()            # warm link
+        for d, n in ((0.08, 4), (0.11, 6), (0.14, 7), (0.17, 8), (0.05, 2)):   # round(d / 0.02)
+            self.sent.clear()
+            ebo_server.do_move(0.0, 0.6, d)
+            self.assertEqual(self.sent.count(ebo_server.motor_frame(rx=0.6)), n, d)
+            self.assertEqual(self.sent[-1], ebo_server.motor_frame())
+
+    def test_warmup_off(self):
+        with mock.patch.object(ebo_server, "WARMUP_S", 0.0):
+            r = ebo_server.do_move(0.0, 0.6, 0.06)
+        self.assertEqual(r["warmup_s"], 0.0)
+        self.assertEqual(self.sent[0], ebo_server.motor_frame(rx=0.6))
+
+    def test_guard_refusal_never_warms_up(self):
+        g = ScriptedGuard(lambda _t: too_close(0.12))
+        with mock.patch.object(ebo_server, "guard", g), mock.patch.object(ebo_server, "GUARD_START_WAIT_S", 0.2):
+            r = ebo_server.do_move(0.5, 0.0, 0.2)
+        self.assertFalse(r["ok"])
+        self.assertEqual(self.sent.count(ebo_server.motor_frame(ly=0.5)), 0)
+        self.assertLessEqual(self.zeros(), 1)                   # only the stop frame, no warm-up
+
+    def test_guarded_forward_warms_up_after_yes(self):
+        g = ScriptedGuard(lambda _t: good(0.9))
+        with mock.patch.object(ebo_server, "guard", g):
+            r = ebo_server.do_move(0.5, 0.0, 0.1)
+        self.assertTrue(r["ok"], r)
+        self.assertGreater(r["warmup_s"], 0)
+        first_motion = self.sent.index(ebo_server.motor_frame(ly=0.5))
+        self.assertGreaterEqual(first_motion, 5)
+
+    def test_drive_warms_up_once_then_streams(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI test client unavailable")
+        p = mock.patch.object(ebo_server, "dock_refusal", lambda *a, **k: None)   # off the dock
+        p.start(); self.addCleanup(p.stop)
+        c = TestClient(ebo_server.app)
+        r = c.post("/drive", json={"ly": 0.0, "rx": 0.5}).json()
+        self.assertTrue(r["ok"])
+        n_zero = self.zeros()
+        self.assertEqual(n_zero, 5)
+        c.post("/drive", json={"ly": 0.0, "rx": 0.5})            # warm now: no second warm-up
+        self.assertEqual(self.zeros(), n_zero)
+        self.assertEqual(self.sent.count(ebo_server.motor_frame(rx=0.5)), 2)

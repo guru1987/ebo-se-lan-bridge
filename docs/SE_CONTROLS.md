@@ -191,3 +191,27 @@ recovering / recovery_aborted / failed, `side`, `side_info`, `steps`, `attempt`)
 brother accumulate in the one-time `dockwatch_notice`, e.g. "docking blocked: obstacle 0.20 m on the
 left - sidestepped right, retrying (1/2)" / "docking failed after 2 attempts: obstacle 0.24 m ahead".
 Needs ebo-depth with `"sectors"` in its live reading; without sectors the side is ambiguous -> no movement.
+
+## Motor frame timing and idle warm-up (2026-10-03)
+
+Measured with an overhead 480 fps camera (porch repo `tools/turncal`, runs 1–6):
+
+- The robot always turns at ~350–470°/s; `rx` sets how long, not how fast. One command turns at most ~95–110°.
+- From an **idle link** a move starts 0–0.25 s late (onset sd 85 ms; 3 of 16 short pulses did not move at all).
+  After **0.6 s of zero-motion frames** the onset sd is ~25 ms and every pulse moves (run5).
+- Frames used to go out every 50 ms and a move was floored to whole 50 ms steps (0.08 s → 0.058 s).
+
+Bridge behaviour now:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `EBO_MOTOR_FRAME_S` | `0.02` | motor frame period; a move lasts the requested duration rounded to the nearest frame |
+| `EBO_WARMUP_S` | `0.6` | zero-motion frames sent before a move when the link was idle (`0` = off) |
+| `EBO_WARMUP_IDLE_S` | `1.0` | idle time after which the next move warms up first |
+
+Applies to `/move`, `/drive` (the first call from idle warms up; concurrent calls get `{"warming": true}`),
+`undock` and the dock-watch recovery (all go through `do_move`). Forward moves are decided by the depth
+guard **before** the warm-up; a refusal never warms up, and a guard verdict that turns bad during the
+warm-up still refuses. Move results report `warmup_s`.
+Note: ROLA streams frames every ~50 ms; 20 ms is new for the firmware — if moves misbehave, set
+`EBO_MOTOR_FRAME_S=0.05`.

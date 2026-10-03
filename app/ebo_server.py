@@ -101,6 +101,54 @@ def motor_frame(ly=0.0, rx=0.0, lx=0.0, ry=0.0, buttons=0):
     # joystick coordinate has the opposite sign, so msg 202 carries -ly.
     return _frame(202, struct.pack('<ffff', lx, -ly, rx, ry) + bytes([buttons & 0xFF]), 211)
 
+# ---- motor frame timing + warm-up (turn calibration 2026-10-03, porch repo tools/turncal) ----
+# ROLA streams msg 202 every ~50 ms; the bridge now uses EBO_MOTOR_FRAME_S (default 20 ms) so a
+# move lasts the requested duration rounded to the nearest frame instead of floored to 50 ms steps
+# (run6: 0.08 s -> 0.058 s, 0.14 s -> 0.109 s). Measured (run5): from an idle link the robot starts a
+# move 0-0.25 s late (onset sd 85 ms, some pulses lost); after 0.6 s of zero-motion frames the onset
+# sd is ~25 ms. So every move from idle (no motor frame for > EBO_WARMUP_IDLE_S) is preceded by
+# EBO_WARMUP_S of zero-motion frames. EBO_WARMUP_S=0 turns the warm-up off.
+MOTOR_FRAME_S = min(0.1, max(0.01, float(os.environ.get("EBO_MOTOR_FRAME_S", "0.02"))))
+WARMUP_S = max(0.0, float(os.environ.get("EBO_WARMUP_S", "0.6")))
+WARMUP_IDLE_S = max(0.0, float(os.environ.get("EBO_WARMUP_IDLE_S", "1.0")))
+_motor_last_t = 0.0                 # monotonic time of the last motor frame sent
+_warm_lock = threading.Lock()       # /drive: only one call performs a warm-up
+
+
+def send_motor(ly=0.0, rx=0.0, lx=0.0, ry=0.0, buttons=0):
+    """Send one msg-202 motor frame and remember when (for the idle warm-up)."""
+    global _motor_last_t
+    bridge.send_rdt(motor_frame(ly=ly, rx=rx, lx=lx, ry=ry, buttons=buttons))
+    _motor_last_t = time.monotonic()
+
+
+def _sleep_until(t):
+    d = t - time.monotonic()
+    if d > 0:
+        time.sleep(d)
+
+
+def motor_frame_count(duration):
+    """Frames for a move of `duration` s: rounded to the nearest frame, at least one."""
+    return max(1, int(round(duration / MOTOR_FRAME_S)))
+
+
+def link_idle():
+    return WARMUP_S > 0 and (time.monotonic() - _motor_last_t) > WARMUP_IDLE_S
+
+
+def warmup_if_idle():
+    """Zero-motion frames for WARMUP_S when the motor link has been idle; returns seconds spent."""
+    if not link_idle():
+        return 0.0
+    t0 = time.monotonic()
+    n = max(1, int(round(WARMUP_S / MOTOR_FRAME_S)))
+    for i in range(n):
+        send_motor()
+        _sleep_until(t0 + (i + 1) * MOTOR_FRAME_S)
+    return round(time.monotonic() - t0, 2)
+
+
 def param_set_frame(group, key, value, ptype=11):
     pid = f"{group}-{key}".encode()[:32].ljust(32, b'\x00')
     return _frame(229, struct.pack('<f', value) + bytes([255, 3]) + pid + bytes([ptype]), 208)
@@ -905,7 +953,7 @@ class DepthGuard:
                         self.forward_until = 0.0
                         self.trip = {"move_id": self.move_id, **info}
                         for _ in range(3):
-                            bridge.send_rdt(motor_frame())
+                            send_motor()
                 if self.trip and self.trip.get("move_id") == self.move_id and "logged" not in self.trip:
                     self.trip["logged"] = True
                     print(f"[guard] STOP: {json.dumps(info)}", flush=True)
@@ -1088,17 +1136,31 @@ def _guard_result(info, phase, moved_s=0.0):
 def do_move(ly: float, rx: float, duration: float = 0.4):
     """Returns {"ok": True, ...} or, when the depth guard stopped/refused a forward move,
     {"ok": False, "stopped_by_guard": True, "phase": "start"|"moving", "reason", "free_ahead_m", ...}."""
-    n = max(1, int(duration * 20))
+    n = motor_frame_count(duration)
     if guard is None or ly <= 0:
-        for _ in range(n):
-            bridge.send_rdt(motor_frame(ly=ly, rx=rx)); time.sleep(0.05)
-        bridge.send_rdt(motor_frame())
-        return {"ok": True} if guard is not None or ly <= 0 else {"ok": True, "guard": "off"}
+        w = warmup_if_idle()
+        t0 = time.monotonic()
+        for i in range(n):
+            send_motor(ly=ly, rx=rx)
+            _sleep_until(t0 + (i + 1) * MOTOR_FRAME_S)
+        send_motor()
+        out = {"ok": True, "warmup_s": w, "moved_s": round(time.monotonic() - t0, 3)}
+        if guard is None and ly > 0:
+            out["guard"] = "off"
+        return out
     ok, info = guard.wait_ready(GUARD_START_WAIT_S)
     if not ok:
-        bridge.send_rdt(motor_frame())
+        send_motor()
         print(f"[guard] refused forward move: {json.dumps(info)}", flush=True)
         return _guard_result(info, "start")
+    w = warmup_if_idle()
+    if w:
+        ok2, last2, _ = guard.verdict
+        if not ok2:   # the view changed during the warm-up: re-decide, never move on a bad verdict
+            send_motor()
+            print(f"[guard] refused forward move after warm-up: {json.dumps(last2)}", flush=True)
+            r = _guard_result(last2, "start"); r["warmup_s"] = w
+            return r
     with guard.lock:
         guard.move_id += 1
         mid = guard.move_id
@@ -1107,27 +1169,28 @@ def do_move(ly: float, rx: float, duration: float = 0.4):
     start_info = info
     t0 = time.monotonic()
     tripped = None
-    for _ in range(n):
+    for i in range(n):
         with guard.lock:
             tr = guard.trip
             if tr is not None and tr.get("move_id") == mid:
                 tripped = tr
                 break
-            bridge.send_rdt(motor_frame(ly=ly, rx=rx))
-        time.sleep(0.05)
+            send_motor(ly=ly, rx=rx)
+        _sleep_until(t0 + (i + 1) * MOTOR_FRAME_S)
     with guard.lock:
         if guard.move_id == mid:
             guard.forward_until = 0.0
-        bridge.send_rdt(motor_frame())
+        send_motor()
     moved = time.monotonic() - t0
     if tripped is not None:
-        return _guard_result(tripped, "moving", moved)
+        r = _guard_result(tripped, "moving", moved); r["warmup_s"] = w
+        return r
     ok, last, _ = guard.verdict
     g = {"free_ahead_m_start": start_info.get("free_ahead_m"),
          "free_ahead_m_end": last.get("free_ahead_m"), "stop_free_m": last.get("stop_free_m")}
     if start_info.get("woke"):
         g.update(woke=True, waited_s=start_info.get("waited_s"))
-    return {"ok": True, "moved_s": round(moved, 2), "guard": g}
+    return {"ok": True, "moved_s": round(moved, 2), "warmup_s": w, "guard": g}
 
 
 # ---- undock: a real straight-forward move off the charging dock ----
@@ -1456,7 +1519,7 @@ class DockWatch:
         lk = guard.lock if guard is not None else threading.Lock()
         with lk:
             for _ in range(5):
-                bridge.send_rdt(motor_frame())
+                send_motor()
                 time.sleep(0.02)
 
     def _end(self, wid, event):
@@ -1995,7 +2058,7 @@ def drive(m: Move, request: Request):
             # guard idle or no fresh reading (video paused): one call waits (waking the stream
             # if needed), the others are refused at once; nothing moves after a /stop meanwhile
             if not guard.drive_wait.acquire(blocking=False):
-                bridge.send_rdt(motor_frame())
+                send_motor()
                 return _guard_result({"reason": "waiting for depth (waking the stream)",
                                       "stop_free_m": guard.stop_free_m()}, "drive")
             try:
@@ -2006,19 +2069,35 @@ def drive(m: Move, request: Request):
             if _stop_count != stops:
                 return _guard_result({**v[1], "reason": "stopped while waiting for depth"}, "drive")
             t_call = time.monotonic()
+        if v is not None and v[0] and link_idle():
+            # warm the idle link only once the guard said yes (a refusal never warms up)
+            if not _warm_lock.acquire(blocking=False):
+                return {"ok": True, "warming": True}
+            try:
+                warmup_if_idle()
+            finally:
+                _warm_lock.release()
+            t_call = time.monotonic()
         with guard.lock:
             if v is None or v[0]:   # re-check atomically with the motor frame
                 v = guard.fresh_verdict(t_call - 0.15)
             if v is None or not v[0]:
-                bridge.send_rdt(motor_frame())
+                send_motor()
                 _last_drive = 0.0
                 info = v[1] if v else {"reason": "waiting for depth", "stop_free_m": guard.stop_free_m()}
                 return _guard_result(info, "drive")
             guard.forward_until = time.monotonic() + 0.4
-            bridge.send_rdt(motor_frame(ly=m.ly, rx=m.rx))
+            send_motor(ly=m.ly, rx=m.rx)
         _last_drive = time.time()
         return {"ok": True}
-    bridge.send_rdt(motor_frame(ly=m.ly, rx=m.rx))
+    if (m.ly != 0 or m.rx != 0) and link_idle():
+        if not _warm_lock.acquire(blocking=False):
+            return {"ok": True, "warming": True}   # another call is warming the link up
+        try:
+            warmup_if_idle()
+        finally:
+            _warm_lock.release()
+    send_motor(ly=m.ly, rx=m.rx)
     _last_drive = time.time()
     return {"ok": True}
 
@@ -2028,7 +2107,7 @@ def _drive_watchdog():
         time.sleep(0.1)
         if _last_drive and (time.time() - _last_drive) > 0.35:
             _last_drive = 0.0
-            try: bridge.send_rdt(motor_frame())   # deadman stop
+            try: send_motor()   # deadman stop
             except Exception: pass
 
 @app.post("/stop")
@@ -2036,7 +2115,7 @@ def stop():
     global _last_drive, _stop_count
     _last_drive = 0.0
     _stop_count += 1
-    for _ in range(3): bridge.send_rdt(motor_frame()); time.sleep(0.02)
+    for _ in range(3): send_motor(); time.sleep(0.02)
     return {"ok": True}
 
 BASIC_ACTIONS = ("dock", "undock", "autoreturn_off", "autoreturn_on")
