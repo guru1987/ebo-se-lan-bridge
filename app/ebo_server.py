@@ -28,6 +28,7 @@ from ebo_mavlink import (FrameBuilder, MAVLinkV1Stream, TimedTask,
                          decode_telemetry, parse_parameter_value,
                          parse_file_server_info, parse_task_ack, parse_timed_task)
 from ebo_media import EboMediaClient, MediaProtocolError
+import ebo_cmdlog as cmdlog
 
 EBO_DIR = os.environ.get("EBO_DIR", "/opt/ebo")
 PORT = int(os.environ.get("EBO_PORT", "8000"))
@@ -144,9 +145,10 @@ def warmup_if_idle():
         return 0.0
     t0 = time.monotonic()
     n = max(1, int(round(WARMUP_S / MOTOR_FRAME_S)))
-    for i in range(n):
-        send_motor()
-        _sleep_until(t0 + (i + 1) * MOTOR_FRAME_S)
+    with cmdlog.origin("warmup"):
+        for i in range(n):
+            send_motor()
+            _sleep_until(t0 + (i + 1) * MOTOR_FRAME_S)
     return round(time.monotonic() - t0, 2)
 
 
@@ -511,6 +513,7 @@ class Bridge:
             if raw is None: raw = self.raw_ids = {}
             rec = raw.setdefault(frame.message_id, {"count": 0, "last": 0.0, "len": 0})
             rec["count"] += 1; rec["last"] = time.time(); rec["len"] = len(frame.payload)
+            cmdlog.log_rx(frame.message_id, frame.payload)
             try:
                 if frame.message_id == 228:
                     value = parse_parameter_value(frame.payload)
@@ -681,9 +684,11 @@ class Bridge:
                 view = view[written:]
 
     def send_rdt(self, mavlink: bytes):
+        cmdlog.log_tx_mavlink(mavlink)   # always-on TX log (non-blocking queue)
         self._send_command(0, mavlink)
 
     def send_ioctl(self, io_type: int, data: bytes = b""):
+        cmdlog.log_tx_ioctl(io_type, data)
         self._send_command(1, struct.pack("<H", io_type) + data)
 
     def video_ready(self):
@@ -1717,6 +1722,7 @@ def require_auth(connection: HTTPConnection):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
 
 app = FastAPI(dependencies=[Depends(require_auth)])
+app.add_middleware(cmdlog.CommandLogMiddleware)   # always-on HTTP log + request id as TX origin
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -2265,7 +2271,9 @@ def _drive_watchdog():
         time.sleep(0.1)
         if _last_drive and (time.time() - _last_drive) > 0.35:
             _last_drive = 0.0
-            try: send_motor()   # deadman stop
+            try:
+                with cmdlog.origin("watchdog"):
+                    send_motor()   # deadman stop
             except Exception: pass
 
 @app.post("/stop")
@@ -2424,7 +2432,7 @@ async def talk(websocket: WebSocket):
 
 if __name__ == "__main__":
     bridge = Bridge()
-    threading.Thread(target=_drive_watchdog, daemon=True).start()
+    threading.Thread(target=_drive_watchdog, name="drive-watchdog", daemon=True).start()
     if GUARD_URL:
         guard = DepthGuard(GUARD_URL, GUARD_CONFIG, WEB_USER, WEB_PASS)
         print(f"[guard] forward-move depth guard on (config {GUARD_CONFIG or '-'}, "

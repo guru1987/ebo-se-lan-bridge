@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
+import os as _os, tempfile as _tempfile
+_os.environ.setdefault("EBO_LOG_DIR", _tempfile.mkdtemp(prefix="ebolog-test-"))  # never write the real command log
 
 import ebo_server
 from ebo_mavlink import FrameBuilder, MAVLinkV1Stream
