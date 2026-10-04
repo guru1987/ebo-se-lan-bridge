@@ -44,6 +44,7 @@ AZ = (-50.0, 50.0)                      # strip azimuth range (deg, levelled)
 EL = (-6.0, 40.0)                       # strip elevation range (deg): mostly above the floor, which
                                         # has strong parallax this close to the camera
 MAX_SHIFT = 80.0                        # searched yaw range (deg)
+YAW_SCALE = float(os.environ.get("EBO_TURN_YAW_SCALE", "1.0"))   # systematic yaw scale correction
 MIN_OVERLAP = 22.0                      # minimum overlap of valid columns (deg)
 MIN_NCC = 0.30
 MIN_MARGIN = 0.06                       # best peak vs best value >= 4 deg away
@@ -184,6 +185,7 @@ def yaw_between(before, after, valid, max_shift=MAX_SHIFT):
     deg = (k + sub) / PPD
     overlap = cols[i] / PPD
     ok = best >= MIN_NCC and best - second >= MIN_MARGIN and overlap >= MIN_OVERLAP
+    deg = deg * YAW_SCALE   # live closure 2026-10-04: 4x90 read 356 deg for a real ~342.5 -> ~0.962
     return {"ok": bool(ok), "deg": round(deg, 2), "ncc": round(best, 3), "margin": round(best - second, 3),
             "overlap_deg": round(overlap, 1), "dy_px": best_dy, "method": "strip_ncc"}
 
