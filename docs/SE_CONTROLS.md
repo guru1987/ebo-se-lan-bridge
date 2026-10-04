@@ -282,3 +282,16 @@ vs the measured two-mode turn model: 96% ok with instant frames; with a simulate
 lag the old fixed wait reproduces the live failure — first pulse ~0° in 40/40 — and settling reaches
 94% within 5°), `tests/test_ebo_turn_vision.py`
 (needs OpenCV; skipped in the bridge venv).
+
+### /turn parallax correction (2026-10-04)
+The camera sits ~48 mm in front of the turning centre, so a turn also moves the camera on a 48 mm
+circle and near objects shift more than the robot turns: apparent/true ≈ 1 + 0.048/d (+9 % at 0.5 m,
++4.5 % at 1 m, +1.5 % at 3 m), always an OVER-read, in both directions. Which side's objects end up in
+the strip overlap decides how much (turning right registers on the right-hand part of the view).
+Before each pulse /turn takes the depth sectors (/depth/live, safety scale undone) of the view it is
+standing in and inverts the exact 2-D geometry (`ebo_turn.parallax_true_yaw`); without depth it measures
+uncorrected. Config: `parallax`, `cam_offset_m` (0.048), `strip_half_deg`, `range_min_m`, `range_far_m`.
+Parallax cannot produce an UNDER-read; a left circle that reads short has another cause (a corrupted
+chained/nominal pulse, or the closure check's own error from the robot drifting between start and end).
+Fresh bridge start: until a stream latency was measured, /turn assumes `lat_unknown_s` (2 s) and does not
+accept an after-frame earlier; an unmeasured (nominal) pulse is re-measured after a long rest.

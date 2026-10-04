@@ -2087,6 +2087,26 @@ class Turn(BaseModel):
     max_pulses: int = Field(default=10, ge=1, le=20)
 
 
+def _turn_depth():
+    """Depth-sector ranges of the view the robot is standing in (for /turn's parallax correction):
+    [[deg (neg = left), metres (safety scale undone), kind], ...] from a /depth/live reading that is
+    at most 1.5 s old; None if depth is not available (then /turn measures without correction)."""
+    if dockwatch is None:
+        return None
+    need, deadline = time.time() - 1.5, time.time() + 3.0
+    while time.time() < deadline:
+        try:
+            rd = dockwatch.fetch()
+        except Exception:
+            rd = None
+        if rd and rd.get("sectors") and float(rd.get("frame_t") or 0) >= need:
+            ss = float(rd.get("safety_scale") or 1.0) or 1.0
+            return [[float(x[0]), float(x[1]) / ss, x[2] if len(x) > 2 else "obstacle"]
+                    for x in rd["sectors"] if x and x[1] is not None]
+        time.sleep(0.2)
+    return None
+
+
 @app.post("/turn")
 def turn(t: Turn, request: Request):
     client = request.client.host if request.client else "-"
@@ -2102,7 +2122,8 @@ def turn(t: Turn, request: Request):
             return {"ok": False, "reason": "robot video is not running"}
         try:
             res = ebo_turn.run_turn(t.deg, t.tol, t.max_pulses, _turn_pulse, turn_vision(),
-                                    ebo_turn.load_config(), log=lambda m: print(m, flush=True))
+                                    ebo_turn.load_config(), log=lambda m: print(m, flush=True),
+                                    depth=_turn_depth)
         except ebo_turn.TurnError as e:
             send_motor()
             res = {"ok": False, "target_deg": t.deg, "turned_deg": None, "pulses": [],

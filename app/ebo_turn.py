@@ -20,6 +20,7 @@ Sign: + = right (clockwise seen from above), like rx.
 This module has no numpy/OpenCV dependency: the vision runs in a helper process (VisionClient).
 """
 import json
+import math
 import os
 import subprocess
 import threading
@@ -65,7 +66,13 @@ DEFAULTS = {
     "high_latency_s": 1.0,      # log a warning when the stream lags more than this (and keep going)
     "wrong_way_deg": 4.0,       # a pulse that turns the other way by more than this aborts the turn
     "direct_max_deg": 65.0,     # re-measure the total against the start frame while within this
-    "direct_agree_deg": 25.0,   # ...and accept it only if it roughly agrees with the summed pulses
+    "direct_agree_deg": 25.0,
+    "parallax": True,           # correct each measured yaw for the camera sitting cam_offset_m in front of
+    "cam_offset_m": 0.048,      # the turning centre (near objects shift more than the robot turns)
+    "strip_half_deg": 50.0,     # the vision strip spans +/- this azimuth (tools/ebo_turn_vision.py AZ)
+    "range_min_m": 0.25,        # clamp depth-sector ranges (nearest obstacle per sector) to this ...
+    "range_far_m": 10.0,        # ... and treat non-obstacle sectors as this far (~pure rotation)
+    "lat_unknown_s": 2.0,       # stream latency assumed before any was measured (fresh bridge start)   # ...and accept it only if it roughly agrees with the summed pulses
 }
 
 
@@ -84,6 +91,54 @@ def load_config(path=None):
             else:
                 cfg[k] = v
     return cfg
+
+
+def _bearing_after(beta, d, theta, r):
+    """Point at bearing beta (rad, + = right) and range d (m) from a camera r m in front of the turning
+    centre; the robot turns by theta (rad, + = right). -> the point's bearing in the new camera view."""
+    px, py = d * math.sin(beta), r + d * math.cos(beta)
+    c, s_ = math.cos(theta), math.sin(theta)
+    vx, vy = px - r * s_, py - r * c
+    return math.atan2(vx * c - vy * s_, vx * s_ + vy * c)
+
+
+def _range_at(beta_deg, sectors, cfg):
+    best = min(sectors, key=lambda x: abs(x[0] - beta_deg))
+    m, kind = float(best[1]), (best[2] if len(best) > 2 else "obstacle")
+    if kind != "obstacle":
+        return cfg["range_far_m"]
+    return min(cfg["range_far_m"], max(cfg["range_min_m"], m))
+
+
+def apparent_yaw(theta_deg, sectors, cfg):
+    """What the strip registration reads for a true turn theta_deg: mean column shift over the strip
+    overlap, each column shifted by the exact 2-D geometry for its depth-sector range."""
+    half, r = cfg["strip_half_deg"], cfg["cam_offset_m"]
+    lo, hi = (-half + theta_deg, half) if theta_deg >= 0 else (-half, half + theta_deg)
+    if hi - lo < 2.0 or not sectors:
+        return theta_deg
+    n, th, acc = 41, math.radians(theta_deg), 0.0
+    for i in range(n):
+        b = lo + (hi - lo) * i / (n - 1)
+        br = math.radians(b)
+        acc += b - math.degrees(_bearing_after(br, _range_at(b, sectors, cfg), th, r))
+    return acc / n
+
+
+def parallax_true_yaw(meas_deg, sectors, cfg):
+    """Invert apparent_yaw: the true turn that reads as meas_deg (bisection; parallax only enlarges)."""
+    if not cfg.get("parallax") or not sectors or abs(meas_deg) < 0.5:
+        return meas_deg
+    lo, hi = 0.0, meas_deg
+    if (apparent_yaw(hi, sectors, cfg) - meas_deg) * (1 if meas_deg > 0 else -1) < 0:
+        return meas_deg            # outside the model's range: leave it
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if (apparent_yaw(mid, sectors, cfg) - meas_deg) * (1 if meas_deg > 0 else -1) < 0:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
 
 
 def settle_pick(frames, now, t_start, t_end, cfg):
@@ -158,7 +213,7 @@ class TurnError(Exception):
     pass
 
 
-def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
+def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print, depth=None):
     """pulse(rx, seconds) -> (ok, info, t_end) where t_end = time.monotonic() after the last frame.
     vision: object with still(after, max_wait) / yaw(a, b) / chain(a, b, t0, t1) returning dicts.
     Returns the /turn result dict."""
@@ -177,6 +232,17 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
     if not ref.get("ok"):
         return result(False, "camera: " + ref.get("reason", "no still frame before turning"))
     ref_id = start_id = ref["id"]
+
+    def sectors_now():
+        if depth is None or not cfg.get("parallax"):
+            return None
+        try:
+            return depth()
+        except Exception as e:      # depth is optional: no correction rather than no turn
+            log(f"[turn] depth unavailable ({e}); no parallax correction")
+            return None
+
+    start_sec = ref_sec = sectors_now()
     for n in range(max_pulses):
         rem = target - total
         if abs(rem) <= tol:
@@ -194,8 +260,13 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
         if not ok:
             return result(False, "pulse refused: " + str(info.get("reason") or info))
         if cfg.get("settle_mode", "settle") == "settle" and hasattr(vision, "settle"):
-            lat = latency_estimate()
+            fresh = not RECENT_LAT
+            lat = latency_estimate() if not fresh else cfg["lat_unknown_s"]
             ckind = dict(cfg, kind=kind)
+            if fresh:
+                # nothing measured yet (fresh start): do not accept an after-frame before the stream
+                # can possibly show the motion
+                ckind["settle_min_s"] = max(cfg["settle_min_s"], lat)
             nm = cfg.get("no_motion_full_s", cfg["no_motion_s"]) if kind == "full" else cfg["no_motion_s"]
             ckind["no_motion_s"] = max(nm, lat + (1.0 if kind == "full" else 0.7))
             ckind["plaus_hold_s"] = max(cfg["plaus_hold_s"], lat + 0.7)
@@ -226,13 +297,25 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
                 m, method = c, "chain"
                 uncertain = True       # chained frames tend to read short; corrected below if possible
             else:
-                m, method = {"deg": sign * expect}, "nominal"
-                uncertain = True
+                # unmeasured: wait for a long rest (late motion included) and measure again
+                hold = max(cfg["start_still_s"], (latency_estimate() or cfg["lat_unknown_s"]) + 0.5)
+                st2 = vision.still(time.monotonic(), hold + 3.0, hold, cfg["start_still_n"])
+                m2 = vision.yaw(ref_id, st2["id"]) if st2.get("ok") else {"ok": False}
+                if m2.get("ok"):
+                    m, method, st = m2, "strip_ncc_late", st2
+                else:
+                    m, method = {"deg": sign * expect}, "nominal"
+                    uncertain = True
         deg = float(m["deg"])
+        raw = deg
+        if method != "nominal":
+            deg = parallax_true_yaw(raw, ref_sec, cfg)
         p = {"kind": kind, "rx": sign * cfg["rx"], "dur": secs, "measured_deg": round(deg, 1),
              "method": method}
         if method == "strip_ncc":
             p["ncc"] = m.get("ncc")
+        if method != "nominal" and abs(deg - raw) >= 0.05:
+            p["measured_raw_deg"] = round(raw, 1)
         for k in ("latency_s", "latency_end_s", "settle_s", "moved"):
             if st.get(k) is not None:
                 p[k] = st[k]
@@ -258,12 +341,14 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
                 return result(False, f"pulse turned the wrong way ({deg:+.1f} deg) - stopped")
         total += deg
         ref_id = st["id"]
+        ref_sec = sectors_now()
         if abs(total) <= cfg["direct_max_deg"]:
             # while the start view still overlaps, measure the TOTAL directly against the first frame:
             # no accumulated error from earlier pulses (nor from a chained / nominal one)
             d = vision.yaw(start_id, st["id"])
-            if d.get("ok") and abs(float(d["deg"]) - total) <= cfg["direct_agree_deg"]:
-                total = float(d["deg"])
+            dd = parallax_true_yaw(float(d["deg"]), start_sec, cfg) if d.get("ok") else None
+            if dd is not None and abs(dd - total) <= cfg["direct_agree_deg"]:
+                total = dd
                 p["total_direct_deg"] = round(total, 1)
                 uncertain = False
         mag = abs(deg)
