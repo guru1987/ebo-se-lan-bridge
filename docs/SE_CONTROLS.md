@@ -295,3 +295,19 @@ Parallax cannot produce an UNDER-read; a left circle that reads short has anothe
 chained/nominal pulse, or the closure check's own error from the robot drifting between start and end).
 Fresh bridge start: until a stream latency was measured, /turn assumes `lat_unknown_s` (2 s) and does not
 accept an after-frame earlier; an unmeasured (nominal) pulse is re-measured after a long rest.
+
+### Dock final approach (2026-10-04)
+
+The dock stands right next to the 3D printer's stand. From close by, the dock watch saw that known static
+stand at ~0.11–0.23 m and blocked every dock ("blocked before docking … 0.11 m"). In the **final approach**
+the pre-dock check is skipped and the watch only stops for a near collision that keeps closing
+(`EBO_DOCKWATCH_FINAL_STOP_M`, default 0.06 m) instead of 0.25 m.
+
+Final approach is
+- explicit: `POST /action/dock?final_approach=1` or JSON body `{"final_approach": true}` (body-qwen explore
+  sends it when its map pose is within ~0.6 m of the dock); `final_approach=0` forces the normal watch;
+- automatic: the bridge's own moves since the robot last stood on the dock add up to at most
+  `EBO_DOCK_NEAR_PATH_M` (default 0.8 m, forward + back, turns don't count). Unknown (bridge started off
+  the dock) = normal.
+
+The dock response carries `final_approach: {"final_approach": bool, "why": ...}` and the watch's `stop_m`.

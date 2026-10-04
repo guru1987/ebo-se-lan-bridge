@@ -15,13 +15,14 @@ Other:         EBO_DIR (/opt/ebo)  EBO_PORT (8000)  EBO_BIND (127.0.0.1)
 import os, json, math, time, struct, threading, subprocess, secrets, socket, base64, urllib.request, urllib.error, http.cookiejar, tempfile
 from dataclasses import replace
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Body, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import HTTPConnection
 from pydantic import BaseModel, Field
 import uvicorn
+from typing import Optional
 
 from ebo_mavlink import (FrameBuilder, MAVLinkV1Stream, TimedTask,
                          decode_telemetry, parse_parameter_value,
@@ -796,13 +797,51 @@ class Bridge:
 # waits up to EBO_DOCK_PREWAKE_S for a fresh, floor-scaled reading; it never refuses to dock.
 # 0 = off. The result is in the /action/dock response ("prewake") and in the dock watch state.
 DOCK_PREWAKE_S = float(os.environ.get("EBO_DOCK_PREWAKE_S", "8"))
+# Final approach (2026-10-04): the dock stands right next to the 3D printer's stand, so from close by the
+# dock watch sees that KNOWN static stand at ~0.11-0.23 m and the pre-check / STOP blocked every dock.
+# Within the final approach the pre-dock check is skipped and the watch only stops for a near collision
+# (EBO_DOCKWATCH_FINAL_STOP_M, closing). Final approach = explicit (POST /action/dock?final_approach=1 or
+# JSON {"final_approach": true}, e.g. body-qwen explore near the dock by its map pose) or automatic: the
+# robot has driven at most EBO_DOCK_NEAR_PATH_M (forward + back, estimated from the bridge's own moves)
+# since it last stood on the dock. final_approach=0 forces the normal watch.
+DOCK_NEAR_PATH_M = float(os.environ.get("EBO_DOCK_NEAR_PATH_M", "0.8"))
+DOCKWATCH_FINAL_STOP_M = float(os.environ.get("EBO_DOCKWATCH_FINAL_STOP_M", "0.06"))
+_path_since_dock = {"m": None, "lock": threading.Lock()}   # None = unknown (no dock seen since start)
+
+
+def path_since_dock_note(ly: float, moved_s) -> None:
+    """Called after every bridge move: estimated straight-line driving (fwd + back) since the last dock."""
+    with _path_since_dock["lock"]:
+        if bridge.charge == 1:
+            _path_since_dock["m"] = 0.0
+        if ly and isinstance(moved_s, (int, float)) and _path_since_dock["m"] is not None:
+            speed = DOCKWATCH_SPEED_MPS * min(1.0, abs(ly) / 0.6)
+            _path_since_dock["m"] += speed * float(moved_s)
+
+
+def dock_final_approach(explicit=None):
+    """-> (final: bool, reason: str)."""
+    if explicit is not None:
+        return bool(explicit), "requested" if explicit else "normal (requested)"
+    with _path_since_dock["lock"]:
+        if bridge.charge == 1:
+            _path_since_dock["m"] = 0.0
+        m = _path_since_dock["m"]
+    if m is not None and m <= DOCK_NEAR_PATH_M:
+        return True, f"near the dock: driven ~{m:.2f} m since it left the dock (<= {DOCK_NEAR_PATH_M:.2f})"
+    return False, ("normal: driven ~%.2f m since the dock" % m) if m is not None else "normal: dock distance unknown"
 _last_dock_prewake = None
 
 
-def do_action(name: str) -> bool:
-    global _last_dock_prewake
+_last_dock_final = None
+
+
+def do_action(name: str, final_approach=None) -> bool:
+    global _last_dock_prewake, _last_dock_final
     if name == "dock":
         _last_dock_prewake = None
+        final, final_why = dock_final_approach(final_approach)
+        _last_dock_final = {"final_approach": final, "why": final_why}
         if guard is not None and DOCK_PREWAKE_S > 0:
             try:
                 _last_dock_prewake = guard.wait_reading(DOCK_PREWAKE_S)
@@ -811,14 +850,15 @@ def do_action(name: str) -> bool:
         # pre-dock check: already blocked before the routine starts (wide free < stop distance)?
         # Then sidestep first (same recovery as after a STOP, counts as an attempt) instead of
         # letting the firmware drive straight into it.
-        if dockwatch is not None and DOCKWATCH_RECOVER and bridge.charge != 1:
+        if dockwatch is not None and DOCKWATCH_RECOVER and bridge.charge != 1 and not final:
             pre = dockwatch.pre_check()
             if pre is not None:
                 dockwatch.start_blocked(prewake=_last_dock_prewake, pre=pre)
                 return True
         for _ in range(5): bridge.send_rdt(command_frame(CMD_DOCK)); time.sleep(0.15)
         if dockwatch is not None:
-            dockwatch.start(prewake=_last_dock_prewake)
+            dockwatch.start(prewake=_last_dock_prewake, stop_m=DOCKWATCH_FINAL_STOP_M if final else None,
+                            final_approach=final)
     elif name in SPECIAL_MOTION_COMMANDS:
         # ROLA sends exactly one COMMAND_MINI frame for a selected motion.
         bridge.send_rdt(command_frame(SPECIAL_MOTION_COMMANDS[name]))
@@ -1134,6 +1174,19 @@ def _guard_result(info, phase, moved_s=0.0):
 
 
 def do_move(ly: float, rx: float, duration: float = 0.4):
+    """Every bridge move goes through here (adds the driven distance to the path-since-dock estimate)."""
+    with _path_since_dock["lock"]:
+        if bridge.charge == 1:
+            _path_since_dock["m"] = 0.0
+    res = _do_move_core(ly, rx, duration)
+    try:
+        path_since_dock_note(ly, res.get("moved_s"))
+    except Exception:
+        pass
+    return res
+
+
+def _do_move_core(ly: float, rx: float, duration: float = 0.4):
     """Returns {"ok": True, ...} or, when the depth guard stopped/refused a forward move,
     {"ok": False, "stopped_by_guard": True, "phase": "start"|"moving", "reason", "free_ahead_m", ...}."""
     n = motor_frame_count(duration)
@@ -1351,17 +1404,21 @@ class DockWatch:
         with self.op.open(urllib.request.Request(self.url, headers=self.hdr), timeout=0.5) as r:
             return json.loads(r.read()).get("reading")
 
-    def start(self, client="-", prewake=None):
+    def start(self, client="-", prewake=None, stop_m=None, final_approach=False):
+        stop_m = DOCKWATCH_STOP_M if stop_m is None else float(stop_m)
         with self.lock:
             self.watch_id += 1
             wid = self.watch_id
             attempt, self.next_attempt = self.next_attempt, 0
             self.current = {"watch_id": wid, "started": time.time(), "client": client, "readings": 0,
                             "blind": 0, "unscaled": 0, "last_free_m": None, "corridor": None, "history": [],
-                            "stopped": False, "prewake": prewake, "attempt": attempt}
-        print(f"[dockwatch] watching dock routine #{wid} {json.dumps(dockwatch_config())}", flush=True)
+                            "stopped": False, "prewake": prewake, "attempt": attempt, "stop_m": stop_m,
+                            "final_approach": bool(final_approach)}
+        print(f"[dockwatch] watching dock routine #{wid} final_approach={bool(final_approach)} stop_m={stop_m} "
+              f"{json.dumps(dockwatch_config())}", flush=True)
         threading.Thread(target=self._run, args=(wid,), name="dockwatch", daemon=True).start()
-        return {"watching": True, "watch_id": wid, "stop_m": DOCKWATCH_STOP_M, "timeout_s": DOCKWATCH_TIMEOUT_S}
+        return {"watching": True, "watch_id": wid, "stop_m": stop_m, "timeout_s": DOCKWATCH_TIMEOUT_S,
+                "final_approach": bool(final_approach)}
 
     def pre_check(self):
         """Before CMD_DOCK: a fresh reading whose WIDE free distance is already < DOCKWATCH_STOP_M
@@ -1536,6 +1593,9 @@ class DockWatch:
         print(f"[dockwatch] end {json.dumps(event)}", flush=True)
 
     def _run(self, wid):
+        with self.lock:
+            stop_m = float((self.current or {}).get("stop_m") or DOCKWATCH_STOP_M) if self.watch_id == wid \
+                else DOCKWATCH_STOP_M
         t0 = time.monotonic()
         values, last_seq, last_wake = [], None, -1e9
         stop_at = stop_free = None   # monotonic time / distance of the STOP
@@ -1599,12 +1659,12 @@ class DockWatch:
                 time.sleep(DOCKWATCH_POLL_S)
                 continue
             if stop_at is None:
-                if free < DOCKWATCH_STOP_M and dock_approaching(values):
+                if free < stop_m and dock_approaching(values):
                     self._stop_robot()
                     stop_at, stop_free = time.monotonic(), free
                     msg = f"docking stopped: obstacle {free:.2f} m ahead"
                     ev = {"kind": "stopped", "message": msg, "free_m": free, "corridor": corridor,
-                          "history": list(values), "stop_m": DOCKWATCH_STOP_M,
+                          "history": list(values), "stop_m": stop_m,
                           "elapsed_s": round(now - t0, 1), "resends": 0, "sectors": rd.get("sectors"),
                           "wide_lateral_m": rd.get("free_ahead_wide_lateral_m")}
                     self.last_event_stop = ev
@@ -2270,20 +2330,25 @@ def do_trick(name: str, force: bool = False, client: str = "-"):
 
 
 @app.post("/action/{name}")
-def action(name: str, request: Request, force: int = 0):
+def action(name: str, request: Request, force: int = 0, final_approach: Optional[int] = None,
+           payload: Optional[dict] = Body(default=None)):
     client = request.client.host if request.client else "-"
+    if final_approach is None and isinstance(payload, dict) and "final_approach" in payload:
+        final_approach = 1 if payload.get("final_approach") else 0
     if name in SPECIAL_MOTION_COMMANDS:
         return with_dockwatch_notice(do_trick(name, bool(force), client))
     if name == "undock":
         return with_dockwatch_notice(do_undock(client))
     if name == "dock":
         notice = dockwatch.take_notice() if dockwatch is not None else None   # an older STOP
-        do_action("dock")
+        do_action("dock", final_approach=None if final_approach is None else bool(final_approach))
         out = {"ok": True, "action": "dock"}
+        if _last_dock_final is not None:
+            out["final_approach"] = _last_dock_final
         if dockwatch is not None:
             w = dockwatch.status()["watch"] or {}
-            out["dockwatch"] = {"watching": True, "watch_id": w.get("watch_id"), "stop_m": DOCKWATCH_STOP_M,
-                                "timeout_s": DOCKWATCH_TIMEOUT_S}
+            out["dockwatch"] = {"watching": True, "watch_id": w.get("watch_id"),
+                                "stop_m": w.get("stop_m", DOCKWATCH_STOP_M), "timeout_s": DOCKWATCH_TIMEOUT_S}
             if w.get("pre_dock_blocked"):
                 out["dockwatch"]["pre_dock_blocked"] = True
         else:

@@ -2,6 +2,7 @@ import struct
 import sys
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -337,8 +338,9 @@ class DockGuardRailTests(unittest.TestCase):
             r = c.post("/action/undock").json()
         self.assertTrue(r["ok"])
         self.assertEqual(r["action"], "undock")
-        self.assertEqual(c.post("/action/dock").json(),
-                         {"ok": True, "action": "dock", "dockwatch": {"watching": False}})
+        r = c.post("/action/dock").json()
+        r.pop("final_approach", None)   # on the dock / just undocked -> final approach (reported, not asserted here)
+        self.assertEqual(r, {"ok": True, "action": "dock", "dockwatch": {"watching": False}})
 
 
 class VideoAndAudioPublicationTests(unittest.TestCase):
@@ -742,6 +744,7 @@ class ScriptedDockWatch(ebo_server.DockWatch):
 
 class DockWatchTests(unittest.TestCase):
     def setUp(self):
+        ebo_server._path_since_dock["m"] = None   # far from the dock unless a test says otherwise
         self.fake = FakeVideoBridge(charge=0, video=True)
         for p in (mock.patch.object(ebo_server, "bridge", self.fake),
                   mock.patch.object(ebo_server, "guard", None),
@@ -906,6 +909,7 @@ class DockPrewakeTests(unittest.TestCase):
     (the dock watch was blind for a whole 6.8 s dock routine); it never refuses to dock."""
 
     def setUp(self):
+        ebo_server._path_since_dock["m"] = None   # far from the dock unless a test says otherwise
         self.fake = TimedVideoBridge(charge=0, video=False)
         for p in (mock.patch.object(ebo_server, "bridge", self.fake),
                   mock.patch.object(ebo_server, "dockwatch", None),
@@ -1036,6 +1040,7 @@ class CyclingDockWatch(ebo_server.DockWatch):
 
 class DockRecoveryTests(unittest.TestCase):
     def setUp(self):
+        ebo_server._path_since_dock["m"] = None   # far from the dock unless a test says otherwise
         self.fake = FakeVideoBridge(charge=0, video=True)
         self.moves, self.docks = [], []
         self.forward_ok = True
@@ -1217,6 +1222,7 @@ class FixedDockWatch(ebo_server.DockWatch):
 
 class PreDockBlockedTests(unittest.TestCase):
     def setUp(self):
+        ebo_server._path_since_dock["m"] = None   # far from the dock unless a test says otherwise
         self.fake = FakeVideoBridge(charge=0, video=True)
         self.moves = []
 
@@ -1406,3 +1412,53 @@ class WarmupAndFrameTimingTests(unittest.TestCase):
         c.post("/drive", json={"ly": 0.0, "rx": 0.5})            # warm now: no second warm-up
         self.assertEqual(self.zeros(), n_zero)
         self.assertEqual(self.sent.count(ebo_server.motor_frame(rx=0.5)), 2)
+
+
+class DockFinalApproachTests(unittest.TestCase):
+    """2026-10-04: the dock stands next to the printer's stand; from close by the dock watch must not
+    stop / pre-block on that KNOWN static stand."""
+    def setUp(self):
+        ebo_server._path_since_dock["m"] = None
+
+    def test_path_since_dock_resets_on_dock_and_accumulates(self):
+        fake = types.SimpleNamespace(charge=1)
+        with mock.patch.object(ebo_server, "bridge", fake):
+            ebo_server.path_since_dock_note(0.6, 1.0)       # still docked -> reset to 0, then +0.14
+            self.assertAlmostEqual(ebo_server._path_since_dock["m"], 0.14, places=3)
+            fake.charge = 0
+            ebo_server.path_since_dock_note(-0.6, 2.0)      # back counts too
+            ebo_server.path_since_dock_note(0.0, 3.0)       # pure turn: no distance
+            self.assertAlmostEqual(ebo_server._path_since_dock["m"], 0.42, places=3)
+            self.assertTrue(ebo_server.dock_final_approach()[0])
+            ebo_server.path_since_dock_note(0.6, 4.0)
+            self.assertFalse(ebo_server.dock_final_approach()[0])
+            self.assertTrue(ebo_server.dock_final_approach(True)[0])
+            self.assertFalse(ebo_server.dock_final_approach(False)[0])
+
+    def test_unknown_distance_is_normal(self):
+        fake = types.SimpleNamespace(charge=0)
+        with mock.patch.object(ebo_server, "bridge", fake):
+            self.assertFalse(ebo_server.dock_final_approach()[0])
+
+    def test_final_approach_skips_precheck_and_uses_final_stop(self):
+        calls = {}
+        class W:
+            def pre_check(self):
+                calls["pre"] = True
+                return {"free_m": 0.11, "kind": "obstacle", "corridor": "wide", "sectors": None}
+            def start(self, prewake=None, stop_m=None, final_approach=False, client="-"):
+                calls["start"] = (stop_m, final_approach)
+            def start_blocked(self, **k):
+                calls["blocked"] = True
+        fake = types.SimpleNamespace(charge=0, send_rdt=lambda *a: None)
+        with mock.patch.object(ebo_server, "bridge", fake), mock.patch.object(ebo_server, "dockwatch", W()), \
+                mock.patch.object(ebo_server, "guard", None), mock.patch.object(ebo_server.time, "sleep", lambda s: None):
+            ebo_server.do_action("dock", final_approach=True)
+            self.assertNotIn("pre", calls)
+            self.assertNotIn("blocked", calls)
+            self.assertEqual(calls["start"], (ebo_server.DOCKWATCH_FINAL_STOP_M, True))
+            calls.clear()
+            ebo_server.do_action("dock", final_approach=False)
+            self.assertIn("pre", calls)
+            self.assertIn("blocked", calls)          # 0.11 m < 0.25 -> blocked before docking (normal rule)
+
