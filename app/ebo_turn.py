@@ -33,11 +33,22 @@ DEFAULTS = {
     "blip_min": {"right": 7.0, "left": 7.0},   # smallest blip seen (deg); a blip is only tried if
                                                # some outcome could land within the tolerance
     "full_min_frac": 0.8,       # use a full pulse when remaining >= 0.8 x the side's nominal full turn
-    "blip_step": 0.02,          # a lost blip (< lost_deg) lengthens that side's blip by this much
-    "blip_max": 0.12,
+    "blip_step": 0.02,          # a lost blip (< lost_deg) lengthens that side's blip by this much,
+                                # a blip that became a full turn shortens it by this much
+    "blip_max": 0.14,
+    "blip_min_dur": 0.06,       # Juraj 2026-10-04 (20 ms frames + warm-up): left 0.06 and 0.13 s gave
+                                # small, usable steps -> short left blips are allowed and adapted
     "lost_deg": 2.0,
-    "settle_s": 0.45,           # after the last motor frame: run-on of a full turn + stream latency
+    "settle_s": 0.45,           # legacy fixed wait (settle_mode "still" only)
     "still_wait_s": 3.0,
+    # settle detection (live 2026-10-04: the robot stream lags 0.3-1.5 s after a wake, so a fixed wait
+    # measured frames from BEFORE the motion and every pulse was counted one pulse late)
+    "settle_mode": "settle",    # "settle" (wait until the picture moved and is still again) | "still"
+    "settle_min_s": 0.5,        # never accept an after-frame earlier than END + this
+    "settle_max_s": 3.0,        # give up (uncertain) when not settled by END + this
+    "no_motion_s": 1.5,         # no change seen until END + this -> the pulse was lost (0 deg)
+    "stable_n": 3,              # settled = >= stable_n consecutive still frames ...
+    "stable_s": 0.3,            # ... spanning >= stable_s, all newer than END and than the first change
     "wrong_way_deg": 4.0,       # a pulse that turns the other way by more than this aborts the turn
     "direct_max_deg": 65.0,     # re-measure the total against the start frame while within this
     "direct_agree_deg": 25.0,   # ...and accept it only if it roughly agrees with the summed pulses
@@ -61,6 +72,37 @@ def load_config(path=None):
     return cfg
 
 
+def settle_pick(frames, now, t_start, t_end, cfg):
+    """Decide whether the picture after a pulse has settled.
+
+    frames: list of (t, changed, still) sorted by t, all with t > t_start, where `changed` = the frame
+    differs from the before-frame (the robot has visibly turned) and `still` = it does not differ from
+    the previous frame. Returns (state, index, info): state "ok" -> frames[index] is the after-frame;
+    "wait" -> ask again later; "timeout" -> give up. info has t_change (first changed frame or None)
+    and moved (bool)."""
+    t_change = next((t for t, ch, _ in frames if ch), None)
+    info = {"t_change": t_change, "moved": t_change is not None}
+    if now < t_end + cfg["settle_min_s"]:
+        return "wait", None, info
+    t_from = max(t_end, t_change) if t_change is not None else t_end
+    cand = [i for i, (t, _, _) in enumerate(frames) if t > t_from]
+    # newest run of consecutive still frames
+    run = []
+    for i in reversed(cand):
+        if frames[i][2]:
+            run.insert(0, i)
+        else:
+            break
+    if len(run) >= cfg["stable_n"] and frames[run[-1]][0] - frames[run[0]][0] >= cfg["stable_s"]:
+        if t_change is not None:
+            return "ok", run[-1], info
+        if now >= t_end + cfg["no_motion_s"]:
+            return "ok", run[-1], info     # nothing moved: the pulse was lost
+    if now >= t_end + cfg["settle_max_s"]:
+        return "timeout", None, info
+    return "wait", None, info
+
+
 class TurnError(Exception):
     pass
 
@@ -78,7 +120,7 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
     def result(ok, reason):
         return {"ok": bool(ok), "target_deg": target, "turned_deg": round(total, 1),
                 "error_deg": round(total - target, 1), "tol_deg": tol, "pulses": pulses,
-                "uncertain": uncertain, "reason": reason}
+                "uncertain": uncertain, "reason": reason, "blip_dur": dict(dur["blip"])}
 
     ref = vision.still(time.monotonic() - 0.05, cfg["still_wait_s"])
     if not ref.get("ok"):
@@ -100,7 +142,10 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
         ok, info, t_end = pulse(sign * cfg["rx"], secs)
         if not ok:
             return result(False, "pulse refused: " + str(info.get("reason") or info))
-        st = vision.still(t_end + cfg["settle_s"], cfg["still_wait_s"])
+        if cfg.get("settle_mode", "settle") == "settle" and hasattr(vision, "settle"):
+            st = vision.settle(ref_id, t_start, t_end, cfg)
+        else:
+            st = vision.still(t_end + cfg["settle_s"], cfg["still_wait_s"])
         if not st.get("ok"):
             pulses.append({"kind": kind, "rx": sign * cfg["rx"], "dur": secs, "measured_deg": None,
                            "method": "none"})
@@ -120,11 +165,26 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
              "method": method}
         if method == "strip_ncc":
             p["ncc"] = m.get("ncc")
+        for k in ("latency_s", "latency_end_s", "settle_s", "moved"):
+            if st.get(k) is not None:
+                p[k] = st[k]
         pulses.append(p)
-        log(f"[turn] pulse {n + 1}: {kind} {side} {secs:.2f}s -> {deg:+.1f} deg ({method})")
+        lat = (f" lat {st['latency_s']:.2f}s" if st.get("latency_s") is not None else " no motion") \
+            if "moved" in st else ""
+        set_s = f" settled {st['settle_s']:.2f}s after END" if st.get("settle_s") is not None else ""
+        log(f"[turn] pulse {n + 1}: {kind} {side} {secs:.2f}s -> {deg:+.1f} deg ({method}){lat}{set_s}")
         if deg * sign < -cfg["wrong_way_deg"]:
-            total += deg
-            return result(False, f"pulse turned the wrong way ({deg:+.1f} deg) - stopped")
+            # re-measure once on a fresh still frame before believing it (a late frame can fake this)
+            st2 = vision.still(time.monotonic(), cfg["still_wait_s"])
+            m2 = vision.yaw(ref_id, st2["id"]) if st2.get("ok") else {"ok": False}
+            if m2.get("ok") and float(m2["deg"]) * sign >= -cfg["wrong_way_deg"]:
+                deg = float(m2["deg"])
+                p["measured_deg"], p["remeasured"] = round(deg, 1), True
+                st = st2
+                log(f"[turn] pulse {n + 1}: re-measured {deg:+.1f} deg")
+            else:
+                total += deg
+                return result(False, f"pulse turned the wrong way ({deg:+.1f} deg) - stopped")
         total += deg
         ref_id = st["id"]
         if abs(total) <= cfg["direct_max_deg"]:
@@ -139,7 +199,11 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
         if mag < cfg["lost_deg"]:
             if kind == "blip":
                 dur["blip"][side] = min(cfg["blip_max"], round(dur["blip"][side] + cfg["blip_step"], 3))
-        elif method != "nominal":
+        elif kind == "blip" and method != "nominal" and \
+                mag >= 0.5 * (nom["blip"][side] + nom["full"][side]):
+            # the blip came out as a full turn (coin-flip region): next blip on this side shorter
+            dur["blip"][side] = max(cfg["blip_min_dur"], round(dur["blip"][side] - cfg["blip_step"], 3))
+        if mag >= cfg["lost_deg"] and method != "nominal":
             # learn what this run's pulses really do (a blip that became a full turn says nothing
             # about blips: classify by size)
             k2 = "full" if mag >= 0.5 * (nom["blip"][side] + nom["full"][side]) else "blip"
@@ -209,6 +273,12 @@ class VisionClient:
 
     def still(self, after, max_wait):
         return self.call({"cmd": "still", "after": after, "max_wait": max_wait}, max_wait + 10)
+
+    def settle(self, before_id, t_start, t_end, cfg):
+        keys = ("settle_min_s", "settle_max_s", "no_motion_s", "stable_n", "stable_s")
+        req = {"cmd": "settle", "before": before_id, "t_start": t_start, "t_end": t_end}
+        req.update({k: cfg[k] for k in keys})
+        return self.call(req, cfg["settle_max_s"] + 15)
 
     def yaw(self, a, b):
         return self.call({"cmd": "yaw", "a": a, "b": b}, 20)

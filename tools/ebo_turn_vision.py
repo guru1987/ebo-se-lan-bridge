@@ -34,6 +34,9 @@ import time
 import numpy as np
 import cv2
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
+from ebo_turn import settle_pick  # noqa: E402  (pure decision logic, shared with the controller tests)
+
 DECODE_W, DECODE_H = 960, 540          # decoder output (the stream is 1920x1080)
 PPD = 4.0                               # strip resolution, pixels per degree
 AZ = (-50.0, 50.0)                      # strip azimuth range (deg, levelled)
@@ -276,6 +279,46 @@ class Service:
         n = len(self.src.since(after)) if self.src else 0
         return {"ok": False, "reason": "no still frame" if n else "no fresh frames"}
 
+    def _strip_cached(self, cache, t, g):
+        if t not in cache:
+            cache[t] = self.mk(g)[0]
+        return cache[t]
+
+    def settle(self, before, t_start, t_end, cfg):
+        """After a pulse: wait until the picture has visibly changed vs the before-frame and is still
+        again (or, if nothing changed, until no_motion_s), never accepting a frame older than END.
+        Returns the settled frame + measured stream latency."""
+        if before not in self.store:
+            return {"ok": False, "reason": "unknown frame id"}
+        bt, bstrip = self.store[before]
+        v = self.mk.valid
+        cache = {}
+        deadline = t_end + float(cfg["settle_max_s"]) + 0.5
+        while True:
+            now = self.clock()
+            fr = self.src.since(t_start)
+            meta, prev = [], None
+            for t, g in fr:
+                s = self._strip_cached(cache, t, g)
+                changed = float(np.abs(s.astype(np.int16) - bstrip.astype(np.int16))[v].mean()) >= STILL_DIFF
+                still = prev is not None and \
+                    float(np.abs(s.astype(np.int16) - prev.astype(np.int16))[v].mean()) < STILL_DIFF
+                meta.append((t, changed, still))
+                prev = s
+            state, idx, info = settle_pick(meta, now, t_start, t_end, cfg)
+            if state == "ok":
+                t = meta[idx][0]
+                i = self._keep(t, cache[t])
+                tc = info["t_change"]
+                return {"ok": True, "id": i, "t": t, "moved": info["moved"],
+                        "latency_s": None if tc is None else round(tc - t_start, 3),
+                        "latency_end_s": None if tc is None else round(tc - t_end, 3),
+                        "settle_s": round(t - t_end, 3), "frames": len(meta)}
+            if state == "timeout" or now > deadline:
+                return {"ok": False, "reason": "picture did not settle" if meta else "no fresh frames",
+                        "moved": info["moved"], "frames": len(meta)}
+            self.sleep(0.05)
+
     def yaw(self, a, b):
         if a not in self.store or b not in self.store:
             return {"ok": False, "reason": "unknown frame id"}
@@ -310,6 +353,8 @@ class Service:
             return {"ok": False, "reason": "not started"}
         if c == "still":
             return self.still(float(req["after"]), float(req.get("max_wait", 3.0)))
+        if c == "settle":
+            return self.settle(int(req["before"]), float(req["t_start"]), float(req["t_end"]), req)
         if c == "yaw":
             return self.yaw(int(req["a"]), int(req["b"]))
         if c == "chain":

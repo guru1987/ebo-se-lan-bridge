@@ -141,6 +141,48 @@ class TurnVisionTests(unittest.TestCase):
         svc.src.frames += [(102.0 + i * 0.03, render_turned(img, i * 8, self.K, self.D, self.tmax)) for i in range(4)]
         self.assertFalse(svc.still(101.9, 0.2)["ok"])
 
+    def test_service_settle_skips_pre_motion_frames(self):
+        """Live 2026-10-04: after a pulse the stream still shows the OLD view for ~1 s. settle must not
+        take those still pre-motion frames; it waits for the change and the new still view."""
+        tv = self.tv
+        name, img = self.frames[0]
+        clock = {"t": 200.0}
+
+        class Src:
+            w, h, url, err = 960, 540, "fake", None
+            def __init__(self, url): self.frames = []
+            def start(self): pass
+            def alive(self): return True
+            def stop(self): pass
+            def since(self, t): return [f for f in self.frames if f[0] > t and f[0] <= clock["t"]]
+
+        svc = tv.Service(source_factory=Src, clock=lambda: clock["t"],
+                         sleep=lambda s: clock.__setitem__("t", clock["t"] + s))
+        svc.src = Src("fake")
+        svc.mk = self.mk
+        turned = render_turned(img, 25, self.K, self.D, self.tmax)
+        mid = render_turned(img, 12, self.K, self.D, self.tmax)
+        fr = [(200.0 + k / 30, img) for k in range(1, 6)]                       # before
+        t_start, t_end = 200.2, 200.5
+        fr += [(200.2 + k / 30, img) for k in range(1, 30)]                     # stream still shows the old view ~1 s
+        fr += [(201.2, mid), (201.233, turned)]                                 # motion appears
+        fr += [(201.233 + k / 30, turned) for k in range(1, 20)]                # new still view
+        svc.src.frames = fr
+        a = svc.still(199.9, 0.5)
+        self.assertTrue(a["ok"], a)
+        cfg = dict(settle_min_s=0.5, settle_max_s=3.0, no_motion_s=1.5, stable_n=3, stable_s=0.3)
+        clock["t"] = t_end
+        b = svc.settle(a["id"], t_start, t_end, cfg)
+        self.assertTrue(b["ok"], b)
+        self.assertTrue(b["moved"])
+        self.assertGreater(b["t"], 201.23)
+        self.assertAlmostEqual(b["latency_end_s"], 0.7, delta=0.05)
+        r = svc.yaw(a["id"], b["id"])
+        self.assertAlmostEqual(r["deg"], 25, delta=2.0)
+        # the old fixed-wait still() would have taken a pre-motion frame here
+        old = svc.still(t_end + 0.45, 0.1)
+        self.assertAlmostEqual(svc.yaw(a["id"], old["id"])["deg"], 0, delta=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

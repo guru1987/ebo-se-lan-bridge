@@ -150,3 +150,257 @@ class TurnControllerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- delayed stream (live 2026-10-04)
+import types  # noqa: E402
+
+
+class SimDelayed:
+    """Continuous-time EBO + camera stream with latency (0.3-1.5 s, per-pulse jitter), 30 fps.
+    The camera shows the heading of (t - latency). Reproduces the live failure: a fixed wait after
+    the pulse grabs frames from BEFORE the motion appears in the stream."""
+
+    FPS = 30.0
+
+    def __init__(self, seed, lat_lo=0.3, lat_hi=1.5, frozen=False):
+        self.rng = random.Random(seed)
+        self.now = 0.0
+        self.segs = []          # (t0, t1, h0, h1) true heading ramps
+        self.heading = 0.0
+        self.lat_lo, self.lat_hi = lat_lo, lat_hi
+        self.lat = self.rng.uniform(lat_lo, lat_hi)
+        self.frozen = frozen
+        self.seed = seed
+        self._cam, self._vmax = {}, -1e9
+        self.frames = {}
+        self.next = 1
+        self.base = SimRobot(seed + 1000)     # reuse the two-mode pulse model
+
+    # clock used by ebo_turn (patched in)
+    def monotonic(self):
+        return self.now
+
+    def true_heading(self, t):
+        h = 0.0
+        for t0, t1, h0, h1 in self.segs:
+            if t >= t1:
+                h = h1
+            elif t > t0:
+                return h0 + (h1 - h0) * (t - t0) / (t1 - t0)
+            else:
+                return h0
+        return h
+
+    def cam(self, t):
+        """Heading shown by the frame that ARRIVES at time t. Deterministic per frame, and the shown
+        moment never goes backwards (a stream delays frames, it does not reorder them)."""
+        k = round(t * self.FPS)
+        if k not in self._cam:
+            jit = random.Random(k * 7919 + self.seed).uniform(-0.03, 0.03)
+            v = max(t - self.lat - jit, self._vmax)
+            self._vmax = v
+            self._cam[k] = self.true_heading(v)
+        return self._cam[k]
+
+    def frame_times(self, after, upto):
+        if self.frozen:
+            return []
+        k0 = int(after * self.FPS) + 1
+        return [k / self.FPS for k in range(k0, int(upto * self.FPS) + 1)]
+
+    def pulse(self, rx, secs):
+        self.lat = self.rng.uniform(self.lat_lo, self.lat_hi)     # jitter per pulse (wake etc.)
+        ok, info, _ = self.base.pulse(rx, secs)
+        deg = self.base.last_pulse
+        t0 = self.now + 0.6 + 0.05                                 # warm-up + onset
+        dur = max(0.05, abs(deg) / 420.0)
+        self.segs.append((t0, t0 + dur, self.heading, self.heading + deg))
+        self.heading += deg
+        self.now += 0.6 + secs + 0.01
+        return ok, info, self.now
+
+    def _keep(self, t):
+        i = self.next
+        self.next += 1
+        self.frames[i] = self.cam(t)
+        return i
+
+    def still(self, after, max_wait):
+        end = self.now + max_wait
+        while self.now < end:
+            ts = self.frame_times(after, self.now)
+            hs = [self.cam(t) for t in ts]
+            for j in range(1, len(ts)):
+                if abs(hs[j] - hs[j - 1]) < 0.5:
+                    return {"ok": True, "id": self._keep(ts[j]), "t": ts[j]}
+            self.now += 0.05
+        return {"ok": False, "reason": "no fresh frames"}
+
+    def settle(self, before_id, t_start, t_end, cfg):
+        hb = self.frames[before_id]
+        while True:
+            ts = self.frame_times(t_start, self.now)
+            hs = [self.cam(t) for t in ts]
+            meta = [(t, abs(h - hb) > 1.5, j > 0 and abs(h - hs[j - 1]) < 0.5) for j, (t, h) in enumerate(zip(ts, hs))]
+            state, idx, info = ebo_turn.settle_pick(meta, self.now, t_start, t_end, cfg)
+            if state == "ok":
+                tc = info["t_change"]
+                return {"ok": True, "id": self._keep(meta[idx][0]), "t": meta[idx][0], "moved": info["moved"],
+                        "latency_s": None if tc is None else tc - t_start, "settle_s": meta[idx][0] - t_end}
+            if state == "timeout":
+                return {"ok": False, "reason": "picture did not settle" if meta else "no fresh frames"}
+            self.now += 0.05
+
+    def yaw(self, a, b):
+        d = self.frames[b] - self.frames[a]
+        if abs(d) > 70.0:
+            return {"ok": False, "deg": 0.0}
+        return {"ok": True, "deg": d + self.rng.gauss(0, 1.0), "ncc": 0.6}
+
+    def chain(self, a, b, t0, t1):
+        d = self.frames[b] - self.frames[a]
+        return {"ok": True, "deg": d * self.rng.uniform(0.85, 1.0)}
+
+
+def run_delayed(target, seed, mode="settle", **kw):
+    sim = SimDelayed(seed, **kw)
+    cfg = ebo_turn.load_config("/nonexistent")
+    cfg["settle_mode"] = mode
+    real_time = ebo_turn.time
+    ebo_turn.time = types.SimpleNamespace(monotonic=sim.monotonic, sleep=lambda s: None)
+    try:
+        res = ebo_turn.run_turn(target, 5.0, 10, sim.pulse, sim, cfg, log=lambda m: None)
+    finally:
+        ebo_turn.time = real_time
+    return res, sim
+
+
+class DelayedStreamTests(unittest.TestCase):
+    TARGETS = [22.5, -22.5, 45, -45, 90, -90, 135, -135, 180, -180]
+
+    def test_old_fixed_wait_lags_one_pulse(self):
+        """Reproduce the live log: with a fixed 0.45 s wait the first pulse reads ~0 and the error is
+        carried into the next pulses; true error is large."""
+        zero_first = bad = n = 0
+        for tg in (90, -90):
+            for seed in range(20):
+                res, sim = run_delayed(tg, seed, mode="still", lat_lo=0.8, lat_hi=1.2)
+                n += 1
+                ps = res["pulses"]
+                if ps and ps[0]["measured_deg"] is not None and abs(ps[0]["measured_deg"]) < 3:
+                    zero_first += 1
+                if abs(sim.heading - tg) > 5:
+                    bad += 1
+        print(f"\n  old fixed wait @0.8-1.2 s latency: first pulse read ~0 in {zero_first}/{n}, "
+              f"true error >5 deg in {bad}/{n}")
+        self.assertGreater(zero_first, n * 0.8)
+        self.assertGreater(bad, n * 0.5)
+
+    def test_settle_converges_with_latency(self):
+        ok = n = 0
+        worst = 0.0
+        lats = []
+        for tg in self.TARGETS:
+            for seed in range(20):
+                res, sim = run_delayed(tg, seed)
+                n += 1
+                err = abs(sim.heading - tg)
+                worst = max(worst, err)
+                if res["ok"] and err <= 5.0 + 1.5:     # measurement noise ~1 deg
+                    ok += 1
+                lats += [p["latency_s"] for p in res["pulses"] if p.get("latency_s") is not None]
+        rate = ok / n
+        print(f"\n  settle @0.3-1.5 s latency: ok within 5 deg {ok}/{n} ({rate:.0%}), worst true error "
+              f"{worst:.1f}; measured latency {min(lats):.2f}-{max(lats):.2f} s")
+        self.assertGreaterEqual(rate, 0.90)
+
+    def test_settle_reports_latency_and_after_end(self):
+        res, sim = run_delayed(45, 3, lat_lo=1.0, lat_hi=1.0)
+        p = res["pulses"][0]
+        self.assertTrue(p["moved"])
+        self.assertGreater(p["latency_s"], 0.9)
+        self.assertGreater(p["settle_s"], 0.5)
+
+    def test_lost_pulse_reads_zero_after_no_motion_window(self):
+        sim = SimDelayed(4, lat_lo=0.9, lat_hi=0.9)
+        sim.base.pulse = lambda rx, secs: (True, {"ok": True}, 0.0)   # nothing moves
+        sim.base.last_pulse = 0.0
+        cfg = ebo_turn.load_config("/nonexistent")
+        real_time = ebo_turn.time
+        ebo_turn.time = types.SimpleNamespace(monotonic=sim.monotonic, sleep=lambda s: None)
+        try:
+            res = ebo_turn.run_turn(20, 5.0, 3, sim.pulse, sim, cfg, log=lambda m: None)
+        finally:
+            ebo_turn.time = real_time
+        self.assertTrue(all(p["moved"] is False and abs(p["measured_deg"]) < 3 for p in res["pulses"]))
+        self.assertTrue(all(p["settle_s"] >= cfg["no_motion_s"] - 0.05 for p in res["pulses"]))
+
+    def test_frozen_stream_times_out_without_counting(self):
+        sim = SimDelayed(5)
+        cfg = ebo_turn.load_config("/nonexistent")
+        real_time = ebo_turn.time
+        ebo_turn.time = types.SimpleNamespace(monotonic=sim.monotonic, sleep=lambda s: None)
+        try:
+            ref = sim.still(-1.0, 1.0)            # one frame exists before freezing
+            sim.frozen = True
+            sim.still = lambda after, w, _r=ref: _r   # start frame available, then the stream stops
+            res = ebo_turn.run_turn(45, 5.0, 5, sim.pulse, sim, cfg, log=lambda m: None)
+        finally:
+            ebo_turn.time = real_time
+        self.assertFalse(res["ok"])
+        self.assertEqual(len(res["pulses"]), 1)
+        self.assertIsNone(res["pulses"][0]["measured_deg"])
+        self.assertIn("camera", res["reason"])
+
+
+class BlipAdaptTests(unittest.TestCase):
+    def test_blip_that_became_full_turn_gets_shorter_and_short_left_blips_are_used(self):
+        """Juraj 2026-10-04: left 0.06-0.13 s give small steps. A right blip that comes out as a full
+        turn must shorten the right blip; short left blips must be tried, not excluded."""
+        sim = SimRobot(9)
+        script = {}
+
+        def pulse(rx, secs):
+            if rx > 0:
+                deg = 55.0 if secs >= 0.10 else 12.0
+            else:
+                deg = -9.0 if secs >= 0.06 else 0.0
+            sim.heading += deg
+            sim.t += 1.0
+            script.setdefault("calls", []).append((rx, secs, deg))
+            return True, {"ok": True}, sim.t
+        sim.pulse = pulse
+        res = ebo_turn.run_turn(30, 5, 10, pulse, sim, ebo_turn.load_config("/nonexistent"), log=lambda m: None)
+        self.assertLess(res["blip_dur"]["right"], 0.10)
+        left = [c for c in script["calls"] if c[0] < 0]
+        self.assertTrue(left, script)
+        self.assertTrue(res["ok"], res)
+
+
+class SettlePickTests(unittest.TestCase):
+    CFG = dict(settle_min_s=0.5, settle_max_s=3.0, no_motion_s=1.5, stable_n=3, stable_s=0.3)
+
+    def test_waits_before_min(self):
+        st, _, _ = ebo_turn.settle_pick([(1.1, True, True)] * 3, 1.2, 0.0, 1.0, self.CFG)
+        self.assertEqual(st, "wait")
+
+    def test_pre_motion_still_frames_are_not_accepted(self):
+        # still frames right after END but before the change shows up must not be picked
+        fr = [(1.0 + k / 30, False, True) for k in range(1, 20)]
+        st, _, _ = ebo_turn.settle_pick(fr, 1.7, 0.0, 1.0, self.CFG)
+        self.assertEqual(st, "wait")
+
+    def test_picks_after_change_and_stability(self):
+        fr = [(1.0 + k / 30, False, True) for k in range(1, 10)]          # pre-motion
+        fr += [(1.3 + k / 30, True, False) for k in range(1, 8)]           # moving (changed, not still)
+        fr += [(1.6 + k / 30, True, True) for k in range(1, 15)]           # settled
+        st, i, info = ebo_turn.settle_pick(fr, 2.2, 0.0, 1.0, self.CFG)
+        self.assertEqual(st, "ok")
+        self.assertGreater(fr[i][0], 1.6)
+        self.assertTrue(info["moved"])
+
+    def test_timeout(self):
+        fr = [(1.0 + k / 30, True, False) for k in range(1, 100)]          # never still
+        st, _, _ = ebo_turn.settle_pick(fr, 4.1, 0.0, 1.0, self.CFG)
+        self.assertEqual(st, "timeout")

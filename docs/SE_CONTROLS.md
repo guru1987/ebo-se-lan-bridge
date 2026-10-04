@@ -231,7 +231,21 @@ frames with the robot's own camera → choose the next pulse from what is left (
 remainder is ≥ 0.8 × the side's full turn, else a blip; a blip is only tried if some outcome could
 land within `tol`) → stop within `tol`, or when nothing can improve it, or after `max_pulses`.
 While the total is ≤ 65° it is re-measured directly against the first frame (no accumulated error).
-Nominal pulse sizes adapt to what the run measures; a lost blip lengthens that side's blip.
+Nominal pulse sizes adapt to what the run measures; a lost blip lengthens that side's blip, a blip
+that came out as a full turn shortens it (range 0.06–0.14 s — with 20 ms frames + warm-up, short
+left blips of 0.06–0.13 s gave small usable steps live, 2026-10-04).
+
+**Settling (fix 2026-10-04):** the first live run measured every pulse one pulse late — right after a
+wake/idle the robot stream lags 0.3–1.5 s, so a fixed wait after the pulse grabbed still frames from
+*before* the motion (pulse 1 read 0°, the next pulse read both, then a "wrong way" abort; 90° became
+~120°). Now the helper's `settle` waits until the picture has **changed** against the before-frame
+and is **still again** (≥ 3 frames over ≥ 0.3 s, all newer than the pulse END and the first change),
+never earlier than END + `settle_min_s` (0.5 s); if nothing changes until END + `no_motion_s` (1.5 s)
+the pulse counts as lost (0°); no settle by END + `settle_max_s` (3 s) → camera error, nothing counted.
+Every pulse logs the measured stream latency (`latency_s` from START, `latency_end_s` from END) and
+`settle_s`. A wrong-way reading is re-measured once on a fresh still frame before aborting. The
+decision logic is `ebo_turn.settle_pick` (pure, shared by the helper and the tests);
+`"settle_mode": "still"` restores the old fixed wait.
 
 Vision (`tools/ebo_turn_vision.py`, helper process — needs numpy + OpenCV, set
 `EBO_TURN_VISION_PYTHON`): frames from the robot's RTSP stream are reprojected into a **levelled
@@ -243,7 +257,9 @@ recorded during the motion are chained, else the pulse counts with its nominal s
 says `"uncertain": true`).
 
 Result: `{"ok", "target_deg", "turned_deg", "error_deg", "tol_deg", "pulses": [{kind, rx, dur,
-measured_deg, method}], "uncertain", "reason"}`. Refused while docked (dock guard). Tuning file:
+measured_deg, method, moved, latency_s, latency_end_s, settle_s}], "uncertain", "reason", "blip_dur"}`. Refused while docked (dock guard). Tuning file:
 `EBO_TURN_CONFIG` (JSON, overrides `ebo_turn.DEFAULTS`). Tests: `tests/test_ebo_turn.py` (controller
-vs the measured two-mode turn model, 94% within 5° at 4 pulses mean), `tests/test_ebo_turn_vision.py`
+vs the measured two-mode turn model: 96% ok with instant frames; with a simulated 0.3–1.5 s stream
+lag the old fixed wait reproduces the live failure — first pulse ~0° in 40/40 — and settling reaches
+94% within 5°), `tests/test_ebo_turn_vision.py`
 (needs OpenCV; skipped in the bridge venv).
