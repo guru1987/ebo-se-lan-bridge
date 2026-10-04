@@ -215,3 +215,35 @@ guard **before** the warm-up; a refusal never warms up, and a guard verdict that
 warm-up still refuses. Move results report `warmup_s`.
 Note: ROLA streams frames every ~50 ms; 20 ms is new for the firmware — if moves misbehave, set
 `EBO_MOTOR_FRAME_S=0.05`.
+
+## POST /turn — turn by a measured angle (closed loop)
+
+`POST /turn {"deg": 90, "tol": 5, "max_pulses": 10}` (+ = right / clockwise seen from above).
+
+Why: the firmware cannot turn by an arbitrary angle. Measured with an overhead 446 fps camera
+(porch repo `tools/turncal`, runs 1–8): every turn pulse ends either as a short **blip** (~7–27°)
+or as a **full turn** (right ~50° ±10, left ~61° ±4 on bare floor); 0.12–0.18 s pulses are a coin
+flip between the two, very short ones are sometimes lost. Timing alone cannot hit an angle.
+
+How (`app/ebo_turn.py`): still frame → one pulse (through the normal move path: dock guard, warm-up
+from idle, 20 ms frames) → wait for a still frame again → measure the yaw between the two still
+frames with the robot's own camera → choose the next pulse from what is left (full turn while the
+remainder is ≥ 0.8 × the side's full turn, else a blip; a blip is only tried if some outcome could
+land within `tol`) → stop within `tol`, or when nothing can improve it, or after `max_pulses`.
+While the total is ≤ 65° it is re-measured directly against the first frame (no accumulated error).
+Nominal pulse sizes adapt to what the run measures; a lost blip lengthens that side's blip.
+
+Vision (`tools/ebo_turn_vision.py`, helper process — needs numpy + OpenCV, set
+`EBO_TURN_VISION_PYTHON`): frames from the robot's RTSP stream are reprojected into a **levelled
+equirectangular strip** (calibrated fisheye `config/ebo_se_fisheye_1920.json`, camera pitched up
+`EBO_TURN_PITCH_DEG`=15°), where a turn about the robot's vertical axis is a pure horizontal shift;
+the shift is found by normalised cross-correlation of gradient images. Synthetic tests on real robot
+frames: mean error < 0.1°, reliable up to ~70°, larger turns are reported as not ok (then frames
+recorded during the motion are chained, else the pulse counts with its nominal size and the result
+says `"uncertain": true`).
+
+Result: `{"ok", "target_deg", "turned_deg", "error_deg", "tol_deg", "pulses": [{kind, rx, dur,
+measured_deg, method}], "uncertain", "reason"}`. Refused while docked (dock guard). Tuning file:
+`EBO_TURN_CONFIG` (JSON, overrides `ebo_turn.DEFAULTS`). Tests: `tests/test_ebo_turn.py` (controller
+vs the measured two-mode turn model, 94% within 5° at 4 pulses mean), `tests/test_ebo_turn_vision.py`
+(needs OpenCV; skipped in the bridge venv).

@@ -2037,6 +2037,83 @@ def move(m: Move, request: Request):
         return with_dockwatch_notice(refusal)
     return with_dockwatch_notice(do_move(m.ly, m.rx, m.duration))
 
+# ---- POST /turn: turn by a MEASURED angle (closed loop with the robot's own camera) ----
+# The firmware only knows a short "blip" or a full turn per pulse, so timing alone cannot hit an
+# angle (tools/turncal). /turn sends one pulse at a time, measures the yaw between still frames of
+# the robot camera (tools/ebo_turn_vision.py, run in a Python with numpy+OpenCV) and decides the next
+# pulse from what is left. Details: app/ebo_turn.py, docs/SE_CONTROLS.md.
+import ebo_turn
+_REPO = Path(__file__).resolve().parent.parent
+TURN_VISION_PYTHON = os.environ.get("EBO_TURN_VISION_PYTHON", "python3")
+TURN_VISION_SCRIPT = os.environ.get("EBO_TURN_VISION_SCRIPT", str(_REPO / "tools" / "ebo_turn_vision.py"))
+TURN_LENS = os.environ.get("EBO_TURN_LENS", str(_REPO / "config" / "ebo_se_fisheye_1920.json"))
+TURN_PITCH_DEG = float(os.environ.get("EBO_TURN_PITCH_DEG", "15"))
+_turn_lock = threading.Lock()
+_turn_vision = None
+
+
+def turn_vision():
+    global _turn_vision
+    if _turn_vision is None:
+        url = (os.environ.get("EBO_TURN_RTSP_URL")
+               or f"rtsp://{STREAM_USER}:{STREAM_PASS}@127.0.0.1:8554/{RTSP_PATH}")
+        _turn_vision = ebo_turn.VisionClient(TURN_VISION_PYTHON, TURN_VISION_SCRIPT, url,
+                                             TURN_LENS, TURN_PITCH_DEG)
+    return _turn_vision
+
+
+def _turn_pulse(rx, secs):
+    refusal = dock_refusal(0.0, rx, "turn", "turn")
+    if refusal is not None:
+        return False, refusal, time.monotonic()
+    r = do_move(0.0, rx, secs)
+    return bool(r.get("ok")), r, time.monotonic()
+
+
+def _turn_video_on():
+    if guard is not None and GUARD_VIDEO_KEEP_URL:
+        try:
+            guard._video_keep()     # also resets ebo-eye's idle pause timer
+        except Exception:
+            pass
+    if not bridge.video_ready():
+        bridge.set_video(True)
+    return bridge.video_ready()
+
+
+class Turn(BaseModel):
+    deg: float = Field(ge=-360.0, le=360.0)          # + = right (clockwise seen from above)
+    tol: float = Field(default=5.0, ge=1.0, le=30.0)
+    max_pulses: int = Field(default=10, ge=1, le=20)
+
+
+@app.post("/turn")
+def turn(t: Turn, request: Request):
+    client = request.client.host if request.client else "-"
+    refusal = dock_refusal(0.0, 1.0 if t.deg >= 0 else -1.0, client, "turn")
+    if refusal is not None:
+        return with_dockwatch_notice(refusal)
+    if bridge.paused:
+        return {"ok": False, "reason": "bridge paused (connection released)"}
+    if not _turn_lock.acquire(blocking=False):
+        return {"ok": False, "reason": "another turn is running"}
+    try:
+        if not _turn_video_on():
+            return {"ok": False, "reason": "robot video is not running"}
+        try:
+            res = ebo_turn.run_turn(t.deg, t.tol, t.max_pulses, _turn_pulse, turn_vision(),
+                                    ebo_turn.load_config(), log=lambda m: print(m, flush=True))
+        except ebo_turn.TurnError as e:
+            send_motor()
+            res = {"ok": False, "target_deg": t.deg, "turned_deg": None, "pulses": [],
+                   "reason": f"vision: {e}"}
+        print("[turn] " + json.dumps({k: res.get(k) for k in
+              ("ok", "target_deg", "turned_deg", "error_deg", "uncertain", "reason")}), flush=True)
+        return with_dockwatch_notice(res)
+    finally:
+        _turn_lock.release()
+
+
 # Analog joystick: the panel POSTs the current vector at ~15 Hz while dragging. Each call
 # sends ONE motor frame (no trailing stop) so motion is continuous; a server-side watchdog
 # stops the robot if updates stop arriving (release, navigation away, network drop).
