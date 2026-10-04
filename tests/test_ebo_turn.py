@@ -49,7 +49,7 @@ class SimRobot:
         return True, {"ok": True}, self.t
 
     # --- vision side
-    def still(self, after, max_wait):
+    def still(self, after, max_wait, hold_s=0.0, hold_n=2):
         i = self.next
         self.next += 1
         self.frames[i] = self.heading
@@ -121,7 +121,7 @@ class TurnControllerTests(unittest.TestCase):
 
     def test_no_camera_aborts_before_moving(self):
         sim = SimRobot(5)
-        sim.still = lambda after, w: {"ok": False, "reason": "no fresh frames"}
+        sim.still = lambda after, w, *a: {"ok": False, "reason": "no fresh frames"}
         res = ebo_turn.run_turn(45, 5, 10, sim.pulse, sim, ebo_turn.load_config("/nonexistent"), log=lambda m: None)
         self.assertFalse(res["ok"])
         self.assertEqual(sim.heading, 0.0)
@@ -163,14 +163,21 @@ class SimDelayed:
 
     FPS = 30.0
 
-    def __init__(self, seed, lat_lo=0.3, lat_hi=1.5, frozen=False):
+    def __init__(self, seed, lat_lo=0.3, lat_hi=1.5, frozen=False, lats=None, snap=0.0,
+                 freeze_p=0.0, distinct=True):
         self.rng = random.Random(seed)
         self.now = 0.0
         self.segs = []          # (t0, t1, h0, h1) true heading ramps
         self.heading = 0.0
         self.lat_lo, self.lat_hi = lat_lo, lat_hi
-        self.lat = self.rng.uniform(lat_lo, lat_hi)
+        self.lats = list(lats) if lats else None     # per-pulse latency schedule (latency jumps)
+        self.lat = self.lats[0] if self.lats else self.rng.uniform(lat_lo, lat_hi)
         self.frozen = frozen
+        self.snap = snap            # snap-back after a full turn (deg, opposite direction; live: 10-20)
+        self.freeze_p = freeze_p    # chance per pulse of a frozen stretch (frames keep arriving, same picture)
+        self.freezes = []           # (t0, t1) arrival windows that repeat the picture of t0
+        self.distinct = distinct    # filter repeated frames like the vision helper does
+        self.npulse = 0
         self.seed = seed
         self._cam, self._vmax = {}, -1e9
         self.frames = {}
@@ -192,9 +199,17 @@ class SimDelayed:
                 return h0
         return h
 
+    def is_dup(self, t):
+        return any(a < t <= b for a, b in self.freezes)
+
     def cam(self, t):
         """Heading shown by the frame that ARRIVES at time t. Deterministic per frame, and the shown
-        moment never goes backwards (a stream delays frames, it does not reorder them)."""
+        moment never goes backwards (a stream delays frames, it does not reorder them). Inside a frozen
+        stretch every frame repeats the picture of the stretch's start."""
+        for a, b in self.freezes:
+            if a < t <= b:
+                t = a
+                break
         k = round(t * self.FPS)
         if k not in self._cam:
             jit = random.Random(k * 7919 + self.seed).uniform(-0.03, 0.03)
@@ -203,20 +218,35 @@ class SimDelayed:
             self._cam[k] = self.true_heading(v)
         return self._cam[k]
 
-    def frame_times(self, after, upto):
+    def frame_times(self, after, upto, distinct=None):
         if self.frozen:
             return []
         k0 = int(after * self.FPS) + 1
-        return [k / self.FPS for k in range(k0, int(upto * self.FPS) + 1)]
+        ts = [k / self.FPS for k in range(k0, int(upto * self.FPS) + 1)]
+        if self.distinct if distinct is None else distinct:
+            ts = [t for t in ts if not self.is_dup(t)]
+        return ts
 
     def pulse(self, rx, secs):
-        self.lat = self.rng.uniform(self.lat_lo, self.lat_hi)     # jitter per pulse (wake etc.)
+        self.npulse += 1
+        if self.lats:
+            self.lat = self.lats[min(self.npulse - 1, len(self.lats) - 1)]
+        else:
+            self.lat = self.rng.uniform(self.lat_lo, self.lat_hi)     # jitter per pulse (wake etc.)
         ok, info, _ = self.base.pulse(rx, secs)
         deg = self.base.last_pulse
         t0 = self.now + 0.6 + 0.05                                 # warm-up + onset
         dur = max(0.05, abs(deg) / 420.0)
         self.segs.append((t0, t0 + dur, self.heading, self.heading + deg))
         self.heading += deg
+        if self.snap and abs(deg) >= 35:
+            sb = -self.snap * (1 if deg > 0 else -1) * self.rng.uniform(0.6, 1.0)
+            t1 = t0 + dur + 0.25
+            self.segs.append((t1, t1 + 0.15, self.heading, self.heading + sb))
+            self.heading += sb
+        if self.freeze_p and self.rng.random() < self.freeze_p:
+            a = self.now + 0.1                                     # the stream stalls during warm-up ...
+            self.freezes.append((a, a + self.rng.uniform(0.5, 1.2)))   # ... and repeats one picture
         self.now += 0.6 + secs + 0.01
         return ok, info, self.now
 
@@ -226,24 +256,35 @@ class SimDelayed:
         self.frames[i] = self.cam(t)
         return i
 
-    def still(self, after, max_wait):
+    def still(self, after, max_wait, hold_s=0.0, hold_n=2):
         end = self.now + max_wait
         while self.now < end:
             ts = self.frame_times(after, self.now)
             hs = [self.cam(t) for t in ts]
-            for j in range(1, len(ts)):
-                if abs(hs[j] - hs[j - 1]) < 0.5:
-                    return {"ok": True, "id": self._keep(ts[j]), "t": ts[j]}
+            if hold_s <= 0:
+                for j in range(1, len(ts)):
+                    if abs(hs[j] - hs[j - 1]) < 0.5:
+                        return {"ok": True, "id": self._keep(ts[j]), "t": ts[j]}
+            elif ts:
+                j0 = len(ts) - 1
+                while j0 > 0 and abs(hs[j0 - 1] - hs[-1]) < 0.5:
+                    j0 -= 1
+                if len(ts) - j0 >= hold_n and ts[-1] - ts[j0] >= hold_s:
+                    return {"ok": True, "id": self._keep(ts[-1]), "t": ts[-1]}
             self.now += 0.05
         return {"ok": False, "reason": "no fresh frames"}
 
     def settle(self, before_id, t_start, t_end, cfg):
         hb = self.frames[before_id]
         while True:
-            ts = self.frame_times(t_start, self.now)
+            ts = self.frame_times(t_start, self.now, cfg.get("distinct_only", True) and self.distinct)
             hs = [self.cam(t) for t in ts]
             meta = [(t, abs(h - hb) > 1.5, j > 0 and abs(h - hs[j - 1]) < 0.5) for j, (t, h) in enumerate(zip(ts, hs))]
             state, idx, info = ebo_turn.settle_pick(meta, self.now, t_start, t_end, cfg)
+            if state == "ok" and info["moved"] and cfg.get("kind"):
+                t = meta[idx][0]
+                if not ebo_turn.plausible(self.cam(t) - hb, cfg["kind"], t, t_end, cfg):
+                    state = "wait"
             if state == "ok":
                 tc = info["t_change"]
                 return {"ok": True, "id": self._keep(meta[idx][0]), "t": meta[idx][0], "moved": info["moved"],
@@ -264,6 +305,7 @@ class SimDelayed:
 
 
 def run_delayed(target, seed, mode="settle", **kw):
+    ebo_turn.RECENT_LAT.clear()
     sim = SimDelayed(seed, **kw)
     cfg = ebo_turn.load_config("/nonexistent")
     cfg["settle_mode"] = mode
@@ -344,7 +386,7 @@ class DelayedStreamTests(unittest.TestCase):
         try:
             ref = sim.still(-1.0, 1.0)            # one frame exists before freezing
             sim.frozen = True
-            sim.still = lambda after, w, _r=ref: _r   # start frame available, then the stream stops
+            sim.still = lambda after, w, *a, _r=ref: _r   # start frame available, then the stream stops
             res = ebo_turn.run_turn(45, 5.0, 5, sim.pulse, sim, cfg, log=lambda m: None)
         finally:
             ebo_turn.time = real_time
@@ -376,6 +418,107 @@ class BlipAdaptTests(unittest.TestCase):
         left = [c for c in script["calls"] if c[0] < 0]
         self.assertTrue(left, script)
         self.assertTrue(res["ok"], res)
+
+
+import legacy_ebo_turn_b033150 as legacy_turn  # noqa: E402  (the controller as it ran live on 2026-10-04)
+
+
+def run_sequence(targets, seed, mod=None, **kw):
+    """Back-to-back /turn calls on ONE simulated robot (leftover motion from the previous call can leak
+    into the next one), like the live 4 x 90 closure test. mod = controller module (legacy or current)."""
+    mod = mod or ebo_turn
+    legacy = mod is legacy_turn
+    sim = SimDelayed(seed, distinct=not legacy, **kw)
+    cfg = mod.load_config("/nonexistent")
+    ebo_turn.RECENT_LAT.clear()
+    real_time = mod.time
+    mod.time = types.SimpleNamespace(monotonic=sim.monotonic, sleep=lambda s: None)
+    out = []
+    try:
+        for tg in targets:
+            h0 = sim.heading
+            res = mod.run_turn(tg, 5.0, 10, sim.pulse, sim, cfg, log=lambda m: None)
+            out.append((res, sim.heading - h0))
+    finally:
+        mod.time = real_time
+    return out, sim
+
+
+class LiveClosureTests(unittest.TestCase):
+    """Live 2026-10-04, 4 x /turn 90: a full pulse 'settled' at +5.6 deg 0.5 s after END (leftover
+    snap-back of the previous turn + a frozen stretch of the stream looked still before the motion
+    arrived); the next pulses were read late, a correction 'turned the wrong way', closure -25 deg.
+    Scenario: latency jumps 0.15 -> 1.8 s between pulses, 15 deg snap-back after full turns, frozen
+    stretches (repeated pictures) during half of the warm-ups."""
+    KW = dict(lats=[0.15, 0.15, 0.15, 1.8, 1.8, 0.4, 1.5, 0.2, 1.8, 0.3, 0.9, 1.6], snap=15.0, freeze_p=0.5)
+
+    def _stats(self, mod):
+        good = turns = wrong = 0
+        closure = []
+        for seed in range(30):
+            out, sim = run_sequence([90, 90, 90, 90], seed, mod=mod, **self.KW)
+            for res, true_d in out:
+                turns += 1
+                good += bool(res["ok"] and abs(true_d - 90) <= 6.5)
+                wrong += "wrong way" in res["reason"]
+            closure.append(abs(sim.heading - 360))
+        return good, turns, wrong, sorted(closure)[len(closure) // 2]
+
+    def test_reproduce_live_failure_with_b033150(self):
+        good, turns, wrong, med = self._stats(legacy_turn)
+        print(f"\n  b033150 (live code), 4x90 scenario: ok {good}/{turns}, wrong-way aborts {wrong}, "
+              f"median closure {med:.1f} deg")
+        self.assertLess(good, turns * 0.5)
+        self.assertGreater(wrong, turns * 0.2)
+        self.assertGreater(med, 20.0)
+
+    def test_fixed_settle_passes(self):
+        good, turns, wrong, med = self._stats(ebo_turn)
+        print(f"\n  fixed settle, same scenario: ok {good}/{turns}, wrong-way aborts {wrong}, "
+              f"median closure {med:.1f} deg")
+        self.assertGreaterEqual(good, turns * 0.85)
+        self.assertEqual(wrong, 0)
+        self.assertLess(med, 10.0)
+
+    def test_frozen_frames_are_not_rest(self):
+        """A frozen stretch right after a pulse must not end the wait: the accepted frame lies after it."""
+        for seed in range(7, 17):
+            sim = SimDelayed(seed, lats=[0.6], freeze_p=1.0)
+            ends = []
+            real_pulse = sim.pulse
+            sim.pulse = lambda rx, secs: (lambda r: (ends.append(r[2]), r)[1])(real_pulse(rx, secs))
+            cfg = ebo_turn.load_config("/nonexistent")
+            real_time = ebo_turn.time
+            ebo_turn.time = types.SimpleNamespace(monotonic=sim.monotonic, sleep=lambda s: None)
+            try:
+                res = ebo_turn.run_turn(55, 5.0, 1, sim.pulse, sim, cfg, log=lambda m: None)
+            finally:
+                ebo_turn.time = real_time
+            p = res["pulses"][0]
+            a, b = sim.freezes[0]
+            self.assertGreater(ends[0] + p["settle_s"], b, (seed, p, sim.freezes))
+
+    def test_implausible_small_full_pulse_keeps_waiting(self):
+        cfg = ebo_turn.load_config("/nonexistent")
+        self.assertFalse(ebo_turn.plausible(5.6, "full", 10.5, 10.0, cfg))   # 0.5 s after END
+        self.assertTrue(ebo_turn.plausible(5.6, "full", 11.6, 10.0, cfg))    # held 1.6 s -> believe it
+        self.assertTrue(ebo_turn.plausible(48.0, "full", 10.5, 10.0, cfg))
+        self.assertFalse(ebo_turn.plausible(1.0, "blip", 10.9, 10.0, cfg))
+        self.assertTrue(ebo_turn.plausible(4.0, "blip", 10.9, 10.0, cfg))
+
+    def test_distinct_frames_drops_repeats_and_bursts(self):
+        fr = [(0.0, "a"), (0.033, "b"), (0.040, "c"), (0.066, "c"), (0.1, "d")]
+        out = ebo_turn.distinct_frames(fr, lambda x, y: x == y, 0.012)
+        self.assertEqual([x for _, x in out], ["a", "b", "c", "d"])   # c at 0.040 = burst after b, dropped
+        out2 = ebo_turn.distinct_frames([(0.0, "a"), (0.033, "a"), (0.066, "b")], lambda x, y: x == y, 0.012)
+        self.assertEqual([x for _, x in out2], ["a", "b"])
+
+    def test_start_frame_waits_for_rest(self):
+        """Back-to-back calls: the second /turn must not start from a frame taken during leftover motion."""
+        out, sim = run_sequence([60, 60], 11, lats=[1.2] * 10, snap=15.0)
+        for res, true_d in out:
+            self.assertTrue(res["ok"], res)
+            self.assertLessEqual(abs(true_d - 60), 6.5)
 
 
 class SettlePickTests(unittest.TestCase):

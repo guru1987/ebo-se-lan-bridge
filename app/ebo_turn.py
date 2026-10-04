@@ -44,11 +44,25 @@ DEFAULTS = {
     # settle detection (live 2026-10-04: the robot stream lags 0.3-1.5 s after a wake, so a fixed wait
     # measured frames from BEFORE the motion and every pulse was counted one pulse late)
     "settle_mode": "settle",    # "settle" (wait until the picture moved and is still again) | "still"
-    "settle_min_s": 0.5,        # never accept an after-frame earlier than END + this
-    "settle_max_s": 3.0,        # give up (uncertain) when not settled by END + this
-    "no_motion_s": 1.5,         # no change seen until END + this -> the pulse was lost (0 deg)
-    "stable_n": 3,              # settled = >= stable_n consecutive still frames ...
-    "stable_s": 0.3,            # ... spanning >= stable_s, all newer than END and than the first change
+    # live closure test 2026-10-04 (4 x 90 deg): a full pulse "settled" 0.50 s after END at +5.6 deg -
+    # leftover motion of the previous /turn plus a frozen stretch of the stream looked like a still
+    # picture before the real motion had arrived. Hence: longer minimum wait, longer stillness, only
+    # distinct new frames count, an implausibly small result keeps waiting, and the start frame must be
+    # still for a while.
+    "settle_min_s": 0.8,        # never accept an after-frame earlier than END + this
+    "settle_max_s": 3.5,        # give up (uncertain) when not settled by END + this
+    "no_motion_s": 1.5,         # no change seen until END + this -> the pulse was lost (0 deg) ...
+    "no_motion_full_s": 2.5,    # ... for a FULL pulse (rarely lost; the stream can lag > 1.5 s)
+    "stable_n": 5,              # settled = >= stable_n consecutive still DISTINCT frames ...
+    "stable_s": 0.5,            # ... spanning >= stable_s, all newer than END and than the first change
+    "distinct_only": True,      # frames that repeat the previous one (same content, or arriving < dup_gap_s
+    "dup_gap_s": 0.012,         # after it: decoder repeats / bursts after a stall) are no evidence of rest
+    "plaus_min_deg": {"full": 30.0, "blip": 3.0},   # a pulse that reads smaller than this is "not
+    "plaus_hold_s": 1.5,        # settled yet" unless it stays that small until END + plaus_hold_s
+    "start_still_s": 0.5,       # before the first pulse: the picture must be still this long ...
+    "start_still_n": 5,         # ... over at least this many distinct frames (no leftover motion)
+    "start_wait_s": 5.0,        # ... waiting at most this long for it
+    "high_latency_s": 1.0,      # log a warning when the stream lags more than this (and keep going)
     "wrong_way_deg": 4.0,       # a pulse that turns the other way by more than this aborts the turn
     "direct_max_deg": 65.0,     # re-measure the total against the start frame while within this
     "direct_agree_deg": 25.0,   # ...and accept it only if it roughly agrees with the summed pulses
@@ -103,6 +117,43 @@ def settle_pick(frames, now, t_start, t_end, cfg):
     return "wait", None, info
 
 
+def plausible(deg, kind, t_cand, t_end, cfg):
+    """Is a settled measurement believable? A full pulse that reads < plaus_min_deg["full"] (or a blip
+    < plaus_min_deg["blip"]) most likely means the motion has not reached the stream yet - keep waiting
+    unless the picture has stayed like that until END + plaus_hold_s (then it really was small/lost)."""
+    lim = float((cfg.get("plaus_min_deg") or {}).get(kind, 0.0))
+    if abs(deg) >= lim:
+        return True
+    return t_cand - t_end >= float(cfg.get("plaus_hold_s", 0.0))
+
+
+def distinct_frames(frames, same, gap):
+    """Drop frames that are no new evidence: arriving < gap s after the previously kept one (burst after a
+    stall) or `same` as it (decoder repeat). frames: [(t, payload)]; same(a, b) -> bool on payloads."""
+    out = []
+    for t, x in frames:
+        if out and (t - out[-1][0] < gap or same(out[-1][1], x)):
+            continue
+        out.append((t, x))
+    return out
+
+
+# Stream latency seen recently (seconds from pulse END to the first visible change), kept across /turn calls:
+# the no-motion and plausibility windows scale with it, so a stream that lags 1.5 s is not mistaken for a
+# lost pulse whose motion then leaks into the next measurement.
+RECENT_LAT = []
+
+
+def note_latency(lat_end):
+    if lat_end is not None and lat_end >= 0:
+        RECENT_LAT.append(float(lat_end))
+        del RECENT_LAT[:-10]
+
+
+def latency_estimate():
+    return max(RECENT_LAT[-5:]) if RECENT_LAT else 0.0
+
+
 class TurnError(Exception):
     pass
 
@@ -122,7 +173,7 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
                 "error_deg": round(total - target, 1), "tol_deg": tol, "pulses": pulses,
                 "uncertain": uncertain, "reason": reason, "blip_dur": dict(dur["blip"])}
 
-    ref = vision.still(time.monotonic() - 0.05, cfg["still_wait_s"])
+    ref = vision.still(time.monotonic(), cfg["start_wait_s"], cfg["start_still_s"], cfg["start_still_n"])
     if not ref.get("ok"):
         return result(False, "camera: " + ref.get("reason", "no still frame before turning"))
     ref_id = start_id = ref["id"]
@@ -143,7 +194,24 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
         if not ok:
             return result(False, "pulse refused: " + str(info.get("reason") or info))
         if cfg.get("settle_mode", "settle") == "settle" and hasattr(vision, "settle"):
-            st = vision.settle(ref_id, t_start, t_end, cfg)
+            lat = latency_estimate()
+            ckind = dict(cfg, kind=kind)
+            nm = cfg.get("no_motion_full_s", cfg["no_motion_s"]) if kind == "full" else cfg["no_motion_s"]
+            ckind["no_motion_s"] = max(nm, lat + (1.0 if kind == "full" else 0.7))
+            ckind["plaus_hold_s"] = max(cfg["plaus_hold_s"], lat + 0.7)
+            ckind["settle_max_s"] = max(cfg["settle_max_s"], ckind["no_motion_s"] + 1.2)
+            st = vision.settle(ref_id, t_start, t_end, ckind)
+            if st.get("ok") and st.get("moved"):
+                note_latency(st.get("latency_end_s"))
+            elif st.get("ok") and st.get("moved") is False:
+                # looks lost: confirm with a longer rest window (a late motion would still show up here)
+                hold = max(cfg["start_still_s"], lat + 0.5)
+                st2 = vision.still(time.monotonic(), hold + 3.0, hold, cfg["start_still_n"])
+                if st2.get("ok"):
+                    m2 = vision.yaw(ref_id, st2["id"])
+                    if m2.get("ok") and abs(float(m2["deg"])) >= cfg["lost_deg"]:
+                        st = dict(st2, moved=True, late=True, settle_s=round(st2["t"] - t_end, 3))
+                        log(f"[turn] pulse {n + 1}: motion arrived late ({float(m2['deg']):+.1f} deg)")
         else:
             st = vision.still(t_end + cfg["settle_s"], cfg["still_wait_s"])
         if not st.get("ok"):
@@ -173,9 +241,12 @@ def run_turn(target, tol, max_pulses, pulse, vision, cfg=None, log=print):
             if "moved" in st else ""
         set_s = f" settled {st['settle_s']:.2f}s after END" if st.get("settle_s") is not None else ""
         log(f"[turn] pulse {n + 1}: {kind} {side} {secs:.2f}s -> {deg:+.1f} deg ({method}){lat}{set_s}")
+        if st.get("latency_end_s") is not None and st["latency_end_s"] > cfg["high_latency_s"]:
+            log(f"[turn] note: high stream latency {st['latency_end_s']:.2f} s after END (continuing)")
         if deg * sign < -cfg["wrong_way_deg"]:
             # re-measure once on a fresh still frame before believing it (a late frame can fake this)
-            st2 = vision.still(time.monotonic(), cfg["still_wait_s"])
+            st2 = vision.still(time.monotonic(), cfg["start_wait_s"], cfg["start_still_s"],
+                               cfg["start_still_n"])
             m2 = vision.yaw(ref_id, st2["id"]) if st2.get("ok") else {"ok": False}
             if m2.get("ok") and float(m2["deg"]) * sign >= -cfg["wrong_way_deg"]:
                 deg = float(m2["deg"])
@@ -271,11 +342,13 @@ class VisionClient:
         r = self.call({"cmd": "still", "after": time.monotonic() - 1.0, "max_wait": 0.1}, 25)
         return r
 
-    def still(self, after, max_wait):
-        return self.call({"cmd": "still", "after": after, "max_wait": max_wait}, max_wait + 10)
+    def still(self, after, max_wait, hold_s=0.0, hold_n=2):
+        return self.call({"cmd": "still", "after": after, "max_wait": max_wait, "hold_s": hold_s,
+                          "hold_n": hold_n}, max_wait + 10)
 
     def settle(self, before_id, t_start, t_end, cfg):
-        keys = ("settle_min_s", "settle_max_s", "no_motion_s", "stable_n", "stable_s")
+        keys = ("settle_min_s", "settle_max_s", "no_motion_s", "stable_n", "stable_s", "distinct_only",
+                "dup_gap_s", "plaus_min_deg", "plaus_hold_s", "kind")
         req = {"cmd": "settle", "before": before_id, "t_start": t_start, "t_end": t_end}
         req.update({k: cfg[k] for k in keys})
         return self.call(req, cfg["settle_max_s"] + 15)

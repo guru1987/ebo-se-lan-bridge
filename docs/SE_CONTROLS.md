@@ -247,6 +247,25 @@ Every pulse logs the measured stream latency (`latency_s` from START, `latency_e
 decision logic is `ebo_turn.settle_pick` (pure, shared by the helper and the tests);
 `"settle_mode": "still"` restores the old fixed wait.
 
+**Settle v2 (live closure test 2026-10-04, 4 × `/turn 90`):** a full pulse "settled" at +5.6° 0.5 s after
+END — leftover snap-back of the previous turn plus a **frozen stretch** of the stream (the same picture
+repeated) looked like a robot at rest before the real motion had arrived; the next pulses were read
+late, a correction "turned the wrong way", closure −25°. Now:
+- only **distinct new frames** count: decoder repeats (byte-identical) and burst frames after a stall
+  (< 12 ms after the previous one) are no evidence of rest (`distinct_only`, `dup_gap_s`);
+- `settle_min_s` 0.8 s, stillness **≥ 5 frames over ≥ 0.5 s**;
+- **plausibility**: a full pulse reading < 30° (a blip < 3°) is "not settled yet" unless it stays like
+  that until END + `plaus_hold_s` (1.5 s) (`plaus_min_deg`);
+- before the **first** pulse the picture must be still for ≥ 0.5 s / 5 frames (`start_still_s`), so
+  leftover motion of a previous `/turn` cannot leak into the start frame;
+- the no-motion and plausibility windows grow with the **recently measured stream latency** (kept across
+  calls); a full pulse is only "lost" after `no_motion_full_s` (2.5 s); a "lost" pulse is confirmed on a
+  longer rest window, and late motion found there is counted ("motion arrived late");
+- latency > 1 s after END is logged as a note, not an error.
+Offline (`tests/test_ebo_turn.py::LiveClosureTests`, latency jumps 0.15 → 1.8 s, 15° snap-back, frozen
+stretches in half the warm-ups, 30 × 4 × 90°): the live code (`tests/legacy_ebo_turn_b033150.py`) gets
+33/120 turns within 5°, 50 wrong-way aborts, median closure 45°; the fix 105/120, 0 wrong-way, 6°.
+
 Vision (`tools/ebo_turn_vision.py`, helper process — needs numpy + OpenCV, set
 `EBO_TURN_VISION_PYTHON`): frames from the robot's RTSP stream are reprojected into a **levelled
 equirectangular strip** (calibrated fisheye `config/ebo_se_fisheye_1920.json`, camera pitched up

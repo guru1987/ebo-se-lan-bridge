@@ -64,6 +64,12 @@ def real_frames():
     return out
 
 
+def noisy(img, k, amp=3):
+    """A real camera never delivers byte-identical frames: add per-frame sensor noise."""
+    rng = np.random.default_rng(k)
+    return np.clip(img.astype(np.int16) + rng.integers(-amp, amp + 1, img.shape), 0, 255).astype(np.uint8)
+
+
 @unittest.skipIf(cv2 is None, "needs numpy + OpenCV")
 class TurnVisionTests(unittest.TestCase):
     @classmethod
@@ -126,12 +132,12 @@ class TurnVisionTests(unittest.TestCase):
 
         svc = tv.Service(source_factory=Src, clock=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + s))
         svc.src = Src("fake")
-        svc.src.frames = [(100.1, img), (100.13, img)]
+        svc.src.frames = [(100.1, noisy(img, 1)), (100.13, noisy(img, 2))]
         svc.mk = self.mk
         a = svc.still(100.0, 1.0)
         self.assertTrue(a["ok"], a)
         t2 = render_turned(img, -30, self.K, self.D, self.tmax)
-        svc.src.frames += [(101.0, t2), (101.03, t2)]
+        svc.src.frames += [(101.0, noisy(t2, 3)), (101.03, noisy(t2, 4))]
         b = svc.still(100.5, 1.0)
         self.assertTrue(b["ok"], b)
         r = svc.yaw(a["id"], b["id"])
@@ -162,11 +168,11 @@ class TurnVisionTests(unittest.TestCase):
         svc.mk = self.mk
         turned = render_turned(img, 25, self.K, self.D, self.tmax)
         mid = render_turned(img, 12, self.K, self.D, self.tmax)
-        fr = [(200.0 + k / 30, img) for k in range(1, 6)]                       # before
+        fr = [(200.0 + k / 30, noisy(img, k)) for k in range(1, 6)]             # before
         t_start, t_end = 200.2, 200.5
-        fr += [(200.2 + k / 30, img) for k in range(1, 30)]                     # stream still shows the old view ~1 s
+        fr += [(200.2 + k / 30, noisy(img, 100 + k)) for k in range(1, 30)]     # stream still shows the old view ~1 s
         fr += [(201.2, mid), (201.233, turned)]                                 # motion appears
-        fr += [(201.233 + k / 30, turned) for k in range(1, 20)]                # new still view
+        fr += [(201.233 + k / 30, noisy(turned, 200 + k)) for k in range(1, 20)]  # new still view
         svc.src.frames = fr
         a = svc.still(199.9, 0.5)
         self.assertTrue(a["ok"], a)
@@ -182,6 +188,67 @@ class TurnVisionTests(unittest.TestCase):
         # the old fixed-wait still() would have taken a pre-motion frame here
         old = svc.still(t_end + 0.45, 0.1)
         self.assertAlmostEqual(svc.yaw(a["id"], old["id"])["deg"], 0, delta=1.0)
+
+
+    def _svc(self, t0):
+        tv = self.tv
+        clock = {"t": t0}
+
+        class Src:
+            w, h, url, err = 960, 540, "fake", None
+            def __init__(self, url): self.frames = []
+            def start(self): pass
+            def alive(self): return True
+            def stop(self): pass
+            def since(self, t): return [f for f in self.frames if f[0] > t and f[0] <= clock["t"]]
+
+        svc = tv.Service(source_factory=Src, clock=lambda: clock["t"],
+                         sleep=lambda s: clock.__setitem__("t", clock["t"] + s))
+        svc.src = Src("fake")
+        svc.mk = self.mk
+        return svc, clock
+
+    def test_frozen_stretch_is_not_rest_and_small_full_pulse_waits(self):
+        """Live 2026-10-04: a full pulse 'settled' at +5.6 deg because a frozen stretch (repeated picture)
+        followed a small leftover change. Repeats must not count as stillness, and a full pulse reading
+        < 30 deg keeps waiting for the real motion."""
+        name, img = self.frames[0]
+        svc, clock = self._svc(300.0)
+        small = render_turned(img, 5.6, self.K, self.D, self.tmax)
+        big = render_turned(img, 52.0, self.K, self.D, self.tmax)
+        fr = [(300.0 + k / 30, noisy(img, k)) for k in range(1, 20)]            # at rest before
+        t_start, t_end = 300.7, 301.5
+        fr += [(300.75, noisy(small, 50))]                                     # leftover small change
+        fr += [(300.75 + k / 30, small) for k in range(1, 25)]                  # FROZEN: identical repeats
+        fr += [(301.6 + k / 30, noisy(small, 300 + k)) for k in range(0, 12)]   # stream back, still small ...
+        fr += [(302.05, render_turned(img, 30, self.K, self.D, self.tmax))]     # ... then the real motion
+        fr += [(302.08 + k / 30, noisy(big, 400 + k)) for k in range(0, 40)]    # new still view
+        svc.src.frames = fr
+        a = svc.still(300.0, 0.5, 0.3, 5)
+        self.assertTrue(a["ok"], a)
+        cfg = dict(settle_min_s=0.8, settle_max_s=3.5, no_motion_s=2.5, stable_n=5, stable_s=0.5,
+                   distinct_only=True, dup_gap_s=0.012, plaus_min_deg={"full": 30.0, "blip": 3.0},
+                   plaus_hold_s=1.5, kind="full")
+        clock["t"] = t_end
+        b = svc.settle(a["id"], t_start, t_end, cfg)
+        self.assertTrue(b["ok"], b)
+        self.assertGreater(b["t"], 302.08)
+        self.assertAlmostEqual(svc.yaw(a["id"], b["id"])["deg"], 52, delta=2.0)
+
+    def test_still_hold_needs_a_rest_period(self):
+        name, img = self.frames[0]
+        svc, clock = self._svc(400.0)
+        moving = [(400.0 + k / 30, noisy(render_turned(img, k * 2.0, self.K, self.D, self.tmax), k))
+                  for k in range(1, 10)]
+        rest = [(400.3 + k / 30, noisy(render_turned(img, 18.0, self.K, self.D, self.tmax), 100 + k))
+                for k in range(1, 25)]
+        svc.src.frames = moving + rest
+        clock["t"] = 400.45                     # only ~0.15 s of rest so far
+        self.assertFalse(svc.still(400.0, 0.0, 0.5, 5)["ok"])
+        clock["t"] = 400.95
+        r = svc.still(400.0, 0.5, 0.5, 5)
+        self.assertTrue(r["ok"], r)
+        self.assertGreaterEqual(r["still_s"], 0.5)
 
 
 if __name__ == "__main__":

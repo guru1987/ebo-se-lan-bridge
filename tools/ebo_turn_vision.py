@@ -35,7 +35,8 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
-from ebo_turn import settle_pick  # noqa: E402  (pure decision logic, shared with the controller tests)
+from ebo_turn import settle_pick, plausible, distinct_frames  # noqa: E402  (pure decision logic,
+#                                                    shared with the controller tests)
 
 DECODE_W, DECODE_H = 960, 540          # decoder output (the stream is 1920x1080)
 PPD = 4.0                               # strip resolution, pixels per degree
@@ -47,6 +48,7 @@ MIN_OVERLAP = 22.0                      # minimum overlap of valid columns (deg)
 MIN_NCC = 0.30
 MIN_MARGIN = 0.06                       # best peak vs best value >= 4 deg away
 STILL_DIFF = 6.0                        # mean |diff| (0..255) between two strips = "not moving"
+DUP_GAP_S = 0.012                       # frames arriving closer than this to the previous one = burst/repeat
 
 
 # ---------------------------------------------------------------- geometry
@@ -265,19 +267,43 @@ class Service:
             self.sleep(0.1)
         return {"ok": False, "reason": "no frames from the robot stream" + (f": {self.src.err}" if self.src.err else "")}
 
-    def still(self, after, max_wait=3.0):
-        """First pair of consecutive frames newer than `after` that do not differ (robot at rest)."""
+    def _distinct(self, after, gap=DUP_GAP_S):
+        """Frames newer than `after` that are new evidence: decoder repeats (byte-identical to the previous
+        kept frame) and burst frames after a stall (arriving < gap after it) are dropped - a frozen
+        stream must not look like a robot at rest."""
+        return distinct_frames(self.src.since(after), lambda a, b: np.array_equal(a, b), gap)
+
+    def _is_still(self, a, b, v):
+        return float(np.abs(a.astype(np.int16) - b.astype(np.int16))[v].mean()) < STILL_DIFF
+
+    def still(self, after, max_wait=3.0, hold_s=0.0, hold_n=2):
+        """A still frame newer than `after`. hold_s == 0: the first pair of consecutive distinct frames
+        that do not differ. hold_s > 0: the NEWEST frames must form a still run of >= hold_n distinct
+        frames spanning >= hold_s (the robot has been at rest for a while - no leftover motion)."""
         end = self.clock() + max_wait
+        cache = {}
+        v = self.mk.valid
         while self.clock() < end:
-            fr = self.src.since(after)
-            for (t0, g0), (t1, g1) in zip(fr, fr[1:]):
-                s0, v = self.mk(g0)
-                s1, _ = self.mk(g1)
-                if float(np.abs(s1.astype(np.int16) - s0.astype(np.int16))[v].mean()) < STILL_DIFF:
-                    return {"ok": True, "id": self._keep(t1, s1), "t": t1}
+            fr = self._distinct(after)
+            strips = [(t, self._strip_cached(cache, t, g)) for t, g in fr]
+            if hold_s <= 0:
+                for (t0, s0), (t1, s1) in zip(strips, strips[1:]):
+                    if self._is_still(s0, s1, v):
+                        return {"ok": True, "id": self._keep(t1, s1), "t": t1}
+            elif strips:
+                run = [strips[-1]]
+                for k in range(len(strips) - 2, -1, -1):
+                    if self._is_still(strips[k][1], run[0][1], v):
+                        run.insert(0, strips[k])
+                    else:
+                        break
+                if len(run) >= hold_n and run[-1][0] - run[0][0] >= hold_s:
+                    t1, s1 = run[-1]
+                    return {"ok": True, "id": self._keep(t1, s1), "t": t1, "still_s": round(t1 - run[0][0], 3)}
             self.sleep(0.05)
-        n = len(self.src.since(after)) if self.src else 0
-        return {"ok": False, "reason": "no still frame" if n else "no fresh frames"}
+        n = len(self._distinct(after)) if self.src else 0
+        return {"ok": False, "reason": ("picture not still" if hold_s > 0 else "no still frame") if n
+                else "no fresh frames"}
 
     def _strip_cached(self, cache, t, g):
         if t not in cache:
@@ -287,25 +313,37 @@ class Service:
     def settle(self, before, t_start, t_end, cfg):
         """After a pulse: wait until the picture has visibly changed vs the before-frame and is still
         again (or, if nothing changed, until no_motion_s), never accepting a frame older than END.
+        Only distinct new frames count (cfg distinct_only); a result that is implausibly small for the
+        pulse kind (cfg plaus_min_deg[kind]) keeps waiting until END + plaus_hold_s.
         Returns the settled frame + measured stream latency."""
         if before not in self.store:
             return {"ok": False, "reason": "unknown frame id"}
         bt, bstrip = self.store[before]
         v = self.mk.valid
         cache = {}
+        checked = {}
+        kind = cfg.get("kind")
         deadline = t_end + float(cfg["settle_max_s"]) + 0.5
+        distinct = cfg.get("distinct_only", True)
         while True:
             now = self.clock()
-            fr = self.src.since(t_start)
+            fr = self._distinct(t_start, float(cfg.get("dup_gap_s", DUP_GAP_S))) if distinct \
+                else self.src.since(t_start)
             meta, prev = [], None
             for t, g in fr:
                 s = self._strip_cached(cache, t, g)
-                changed = float(np.abs(s.astype(np.int16) - bstrip.astype(np.int16))[v].mean()) >= STILL_DIFF
-                still = prev is not None and \
-                    float(np.abs(s.astype(np.int16) - prev.astype(np.int16))[v].mean()) < STILL_DIFF
+                changed = not self._is_still(bstrip, s, v)
+                still = prev is not None and self._is_still(prev, s, v)
                 meta.append((t, changed, still))
                 prev = s
             state, idx, info = settle_pick(meta, now, t_start, t_end, cfg)
+            if state == "ok" and info["moved"] and kind:
+                t = meta[idx][0]
+                if t not in checked:
+                    r = yaw_between(bstrip, cache[t], v)
+                    checked[t] = (not r.get("ok")) or plausible(r["deg"], kind, t, t_end, cfg)
+                if not checked[t]:
+                    state = "wait"          # e.g. a full pulse reading +5 deg: the motion is still coming
             if state == "ok":
                 t = meta[idx][0]
                 i = self._keep(t, cache[t])
@@ -352,7 +390,8 @@ class Service:
         if self.src is None:
             return {"ok": False, "reason": "not started"}
         if c == "still":
-            return self.still(float(req["after"]), float(req.get("max_wait", 3.0)))
+            return self.still(float(req["after"]), float(req.get("max_wait", 3.0)),
+                              float(req.get("hold_s", 0.0)), int(req.get("hold_n", 2)))
         if c == "settle":
             return self.settle(int(req["before"]), float(req["t_start"]), float(req["t_end"]), req)
         if c == "yaw":
