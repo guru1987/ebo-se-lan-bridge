@@ -1,0 +1,22 @@
+{
+  "measured_on": "2026-10-15",
+  "speed_parameter": {"group": "control", "key": "speed", "value": 10},
+  "measurement": "camera yaw, calibrated fisheye strip registration; no depth parallax correction",
+  "presets": {
+    "small_left": {"ly": 0, "rx": -0.33, "duration": 0.10, "observed_camera_yaw_deg": -9.50},
+    "small_right": {"ly": 0, "rx": 0.33, "duration": 0.10, "observed_camera_yaw_deg": 7.25},
+    "medium_left": {"ly": 0, "rx": -0.2, "duration": 0.1, "observed_camera_yaw_deg": -13.75},
+    "medium_right": {"ly": 0, "rx": 0.2, "duration": 0.1, "observed_camera_yaw_deg": 12.75}
+  },
+  "limitations": [
+    "60 ms pulses were lost during a later MCP test; use 100 ms for the tool presets.",
+    "MCP end-to-end repeat at 100 ms measured -6.39 degrees left and +10.75 degrees right.",
+    "Empirical examples, not guaranteed target angles or statistically validated tolerances.",
+    "Repeated 0.33-deflection tests at 100 ms gave -9.50 and +7.25 degrees.",
+    "40 ms at 0.33 deflection gave no measurable turn in either direction.",
+    "0.10 deflection at 60 and 100 ms gave no measurable turn.",
+    "0.20 deflection at 60 ms gave no measurable turn.",
+    "Forward/backward command is zero; mechanical translation was not independently measured.",
+    "These presets use POST /move; the existing POST /turn defaults were not changed."
+  ]
+}
