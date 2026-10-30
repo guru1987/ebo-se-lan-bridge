@@ -18,3 +18,6 @@ app/ebo_bridge-*
 auto.crt
 auto.key
 __pycache__/
+
+# local backup copies (kept on disk, never committed)
+*.bak-*
