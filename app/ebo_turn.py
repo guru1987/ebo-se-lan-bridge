@@ -412,15 +412,46 @@ class VisionClient:
             raise TurnError("vision helper exited")
         return out
 
+    # F55 (2026-10-29): "start" goes out on EVERY call, not only when a new helper is spawned. After the
+    # video idle-pause the helper process stayed alive with a dead/stalled decoder and every later /turn
+    # failed "no fresh frames". The helper's start is a no-op while its decoder is alive and delivering
+    # frames (returns at once); otherwise it (re)starts the decoder and waits for the first frames. If
+    # that fails (e.g. the RTSP path has no publisher yet right after video re-enable) the helper is
+    # killed and respawned, retrying until start_retry_s has passed.
+    start_retry_s = 8.0
+    start_wait_s = 3.0
+
+    def _kill(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            self.proc = None
+
+    def _ensure_frames(self):
+        deadline = time.monotonic() + self.start_retry_s
+        reason = "vision helper failed to start"
+        while True:
+            if self.proc is None or self.proc.poll() is not None:
+                self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            try:
+                r = self._req({"cmd": "start", "url": self.url, "lens": self.lens,
+                               "pitch_deg": self.pitch, "wait": self.start_wait_s}, self.start_wait_s + 20)
+            except TurnError as e:
+                r = {"ok": False, "reason": str(e)}
+            if r.get("ok"):
+                return
+            reason = r.get("reason") or reason
+            self._kill()                  # fresh helper + fresh decoder on the next try
+            if time.monotonic() >= deadline:
+                raise TurnError(reason)
+            time.sleep(0.5)
+
     def call(self, obj, timeout=15.0):
         with self.lock:
             self.last = time.monotonic()
-            if self.proc is None or self.proc.poll() is not None:
-                self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                r = self._req({"cmd": "start", "url": self.url, "lens": self.lens,
-                               "pitch_deg": self.pitch}, 20)
-                if not r.get("ok"):
-                    raise TurnError(r.get("reason", "vision helper failed to start"))
+            self._ensure_frames()
             return self._req(obj, timeout)
 
     def ensure_started(self):

@@ -547,3 +547,86 @@ class SettlePickTests(unittest.TestCase):
         fr = [(1.0 + k / 30, True, False) for k in range(1, 100)]          # never still
         st, _, _ = ebo_turn.settle_pick(fr, 4.1, 0.0, 1.0, self.CFG)
         self.assertEqual(st, "timeout")
+
+
+# ---------------------------------------------------------------- F55: VisionClient sends start on every call
+_FAKE_HELPER = r'''
+import json, os, sys
+# url = path of a counter file; the first FAIL_N starts (counted across helper processes) fail like
+# "RTSP path has no publisher yet"; "kill_decoder" simulates the decoder dying after the video idle-pause.
+alive = False
+for line in sys.stdin:
+    req = json.loads(line)
+    c = req.get("cmd")
+    if c == "start":
+        path = req["url"]
+        n = int(open(path).read() or 0) if os.path.exists(path) else 0
+        open(path, "w").write(str(n + 1))
+        fail_n = int(os.environ.get("FAIL_N", "0"))
+        if n < fail_n:
+            out = {"ok": False, "reason": "no frames from the robot stream"}
+        else:
+            alive = True
+            out = {"ok": True}
+    elif c == "kill_decoder":
+        alive = False
+        out = {"ok": True}
+    elif c == "still":
+        out = {"ok": True, "id": 1, "t": 0.0} if alive else {"ok": False, "reason": "no fresh frames"}
+    elif c == "stop":
+        out = {"ok": True}
+    else:
+        out = {"ok": False, "reason": "unknown"}
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
+'''
+
+
+class VisionClientStartTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="f55_vc_")
+        self.script = os.path.join(self.dir, "fake_helper.py")
+        with open(self.script, "w") as f:
+            f.write(_FAKE_HELPER)
+        self.counter = os.path.join(self.dir, "starts.txt")
+        self.clients = []
+
+    def tearDown(self):
+        os.environ.pop("FAIL_N", None)
+        for vc in self.clients:
+            vc._kill()
+
+    def _client(self, retry_s=8.0):
+        vc = ebo_turn.VisionClient(sys.executable, self.script, self.counter, "lens.json", 15.0, idle_s=600)
+        vc.start_retry_s = retry_s
+        self.clients.append(vc)
+        return vc
+
+    def _starts(self):
+        return int(open(self.counter).read())
+
+    def test_start_sent_on_every_call_recovers_dead_decoder(self):
+        vc = self._client()
+        self.assertTrue(vc.still(0.0, 0.1)["ok"])
+        pid = vc.proc.pid
+        vc.call({"cmd": "kill_decoder"})            # video idle-pause: the decoder died, helper alive
+        r = vc.still(0.0, 0.1)                      # old code: "no fresh frames"
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(vc.proc.pid, pid)          # same helper, decoder restarted by "start"
+        self.assertEqual(self._starts(), 3)         # one start per call
+
+    def test_start_failure_respawns_and_retries(self):
+        os.environ["FAIL_N"] = "2"                  # stream not published yet for the first two tries
+        vc = self._client()
+        r = vc.still(0.0, 0.1)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self._starts(), 3)
+
+    def test_start_gives_up_after_retry_window(self):
+        os.environ["FAIL_N"] = "1000"
+        vc = self._client(retry_s=1.0)
+        with self.assertRaises(ebo_turn.TurnError) as cm:
+            vc.still(0.0, 0.1)
+        self.assertIn("no frames", str(cm.exception))
+        self.assertIsNone(vc.proc)
